@@ -1,4 +1,9 @@
+
+<Icon data={beer}/>
+
 <script>
+  import Icon from 'svelte-awesome';
+  import { beer, refresh, comment, codeFork, camera, ban } from 'svelte-awesome/icons';
   import {onMount} from 'svelte';
   let count = 0;
   onMount(() => {

@@ -9,7 +9,7 @@ import {
   isRemoteUrl,
   replaceExtension,
 } from '../util';
-import {getUrlForFile} from './file-urls';
+import {getBuiltFileUrl, getUrlForFile} from './file-urls';
 
 /** Perform a file disk lookup for the requested import specifier. */
 export function getFsStat(importedFileOnDisk: string): fs.Stats | false {
@@ -46,9 +46,9 @@ function resolveSourceSpecifier(lazyFileLoc: string, config: SnowpackConfig) {
   } else {
     lazyFileLoc = lazyFileLoc + '.js';
   }
-
   // Transform the file extension (from input to output)
   const extensionMatch = getExtensionMatch(lazyFileLoc, config._extensionMap);
+  console.log('lazyFileLoc', lazyFileLoc, extensionMatch);
 
   if (extensionMatch) {
     const [inputExt, outputExts] = extensionMatch;
@@ -80,8 +80,13 @@ export function createImportResolver({fileLoc, config}: {fileLoc: string; config
     if (spec.startsWith('/')) {
       return spec;
     }
+    // If you're serving a file directly out of a node_modules, just transform it.
+    if(fileLoc.includes('node_modules')) {
+      return getBuiltFileUrl(spec, config);
+    }
     if (spec.startsWith('./') || spec.startsWith('../')) {
       const importedFileLoc = path.resolve(path.dirname(fileLoc), spec);
+      console.log('EXIST?', importedFileLoc);
       return resolveSourceSpecifier(importedFileLoc, config) || spec;
     }
     const aliasEntry = findMatchingAliasEntry(config, spec);

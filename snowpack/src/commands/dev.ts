@@ -51,7 +51,7 @@ import {
   wrapImportProxy,
 } from '../build/build-import-proxy';
 import {buildFile as _buildFile, getInputsFromOutput} from '../build/build-pipeline';
-import {getUrlForFile} from '../build/file-urls';
+import {getBuiltFileUrl, getUrlForFile} from '../build/file-urls';
 import {createImportResolver} from '../build/import-resolver';
 import {EsmHmrEngine} from '../hmr-server-engine';
 import {logger} from '../logger';
@@ -464,41 +464,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       };
     }
 
-    if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
-      try {
-        const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
-        const loadedModule = await pkgSource.load(webModuleUrl, commandOptions);
-        let code = loadedModule;
-        if (isProxyModule) {
-          code = await wrapImportProxy({url: reqPath, code: code.toString(), hmr: isHMR, config});
-        }
-        let contentType = path.extname(originalReqPath)
-          ? mime.lookup(path.extname(originalReqPath))
-          : 'application/javascript';
-        // We almost never want an 'application/octet-stream' response, so just
-        // convert to JS until we have proper "raw" handling in the URL for non-JS responses.
-        if (contentType === 'application/octet-stream') {
-          contentType = 'application/javascript';
-        }
-        return {
-          contents: encodeResponse(code, encoding),
-          originalFileLoc: null,
-          contentType,
-        };
-      } catch (err) {
-        const errorTitle = `Dependency Load Error`;
-        const errorMessage = err.message;
-        logger.error(`${errorTitle}: ${errorMessage}`);
-        hmrEngine.broadcastMessage({
-          type: 'error',
-          title: errorTitle,
-          errorMessage,
-          fileLoc: reqPath,
-        });
-        throw err;
-      }
-    }
-
     const attemptedFileLoads: string[] = [];
     function attemptLoadFile(requestedFile): Promise<null | string> {
       if (attemptedFileLoads.includes(requestedFile)) {
@@ -585,16 +550,59 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       return null;
     }
 
-    let foundFile = await getFileFromUrl(reqPath);
+
+    let foundFile: FoundFile | null;
+    if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
+        const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
+        const loadedModuleLoc = await pkgSource.load(webModuleUrl, commandOptions);
+        requestedFileExt = path.extname(getBuiltFileUrl(loadedModuleLoc, config));
+        responseFileExt = path.extname(getBuiltFileUrl(loadedModuleLoc, config));
+        isRoute = false;
+        foundFile = {
+          fileLoc: loadedModuleLoc,
+          isStatic: false,
+          isResolve: true,
+        };
+      //   let code = loadedModule;
+      //   if (isProxyModule) {
+      //     code = await wrapImportProxy({url: reqPath, code: code.toString(), hmr: isHMR, config});
+      //   }
+      //   let contentType = path.extname(originalReqPath)
+      //     ? mime.lookup(path.extname(originalReqPath))
+      //     : 'application/javascript';
+      //   // We almost never want an 'application/octet-stream' response, so just
+      //   // convert to JS until we have proper "raw" handling in the URL for non-JS responses.
+      //   if (contentType === 'application/octet-stream') {
+      //     contentType = 'application/javascript';
+      //   }
+      //   return {
+      //     contents: encodeResponse(code, encoding),
+      //     originalFileLoc: null,
+      //     contentType,
+      //   };
+      // } catch (err) {
+      //   const errorTitle = `Dependency Load Error`;
+      //   const errorMessage = err.message;
+      //   logger.error(`${errorTitle}: ${errorMessage}`);
+      //   hmrEngine.broadcastMessage({
+      //     type: 'error',
+      //     title: errorTitle,
+      //     errorMessage,
+      //     fileLoc: reqPath,
+      //   });
+      //   throw err;
+      // }
+    } else {
+      foundFile = await getFileFromUrl(reqPath);
+    }
     if (!foundFile && isRoute) {
       foundFile = await getFileFromLazyUrl(reqPath);
     }
-
     if (!foundFile) {
       throw new NotFoundError(attemptedFileLoads);
     }
 
-    if (!isRoute && !isProxyModule && !isSourceMap) {
+    if (!isRoute && !isProxyModule && !isSourceMap && !reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
       const cleanUrl = url.parse(reqUrl).pathname;
       const cleanUrlWithMainExtension =
         cleanUrl && replaceExtension(cleanUrl, path.extname(cleanUrl), '.js');
@@ -719,6 +727,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         (spec) => {
           // Try to resolve the specifier to a known URL in the project
           let resolvedImportUrl = resolveImportSpecifier(spec);
+          console.log('spec', spec, '=>', resolvedImportUrl);
           // Handle a package import
           if (!resolvedImportUrl) {
             resolvedImportUrl = pkgSource.resolvePackageImport(fileLoc, spec, config);
@@ -854,6 +863,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         throw err;
       }
       if (!responseContent) {
+        console.log(1, fileLoc, responseContent);
         throw new NotFoundError([fileLoc]);
       }
       return {
@@ -894,6 +904,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         throw err;
       }
       if (!responseContent) {
+        console.log(2, fileLoc, responseContent);
         throw new NotFoundError([fileLoc]);
       }
       return {
@@ -1015,6 +1026,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       throw err;
     }
     if (!responseContent) {
+      console.log(3, fileLoc, requestedFileExt, responseOutput, responseContent);
       throw new NotFoundError([fileLoc]);
     }
 

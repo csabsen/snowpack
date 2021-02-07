@@ -74,7 +74,6 @@ export default {
     logger.info(`types updated. ${colors.dim('→ ./.snowpack/types')}`, {
       name: 'packageOptions.types',
     });
-    return {imports: {}};
   },
 
   modifyBuildInstallOptions({installOptions, config, lockfile}) {
@@ -166,12 +165,8 @@ export default {
     return body;
   },
 
-  resolvePackageImport(missingPackage: string, _: ImportMap, config: SnowpackConfig): string {
-    return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', missingPackage);
-  },
-
-  async recoverMissingPackageImport(): Promise<ImportMap> {
-    throw new Error('Unexpected Error: No such thing as a "missing" package import with Skypack.');
+  resolvePackageImport(source: string, spec: string, config: SnowpackConfig): string {
+    return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', spec);
   },
 
   clearCache() {

@@ -353,7 +353,7 @@ export interface PackageSource {
    * for this to complete before continuing. Example: For "local", this involves
    * running esinstall (if needed) to prepare your local dependencies as ESM.
    */
-  prepare(commandOptions: CommandOptions): Promise<ImportMap>;
+  prepare(commandOptions: CommandOptions): Promise<void>;
   /**
    * Load a dependency with the given spec (ex: "/pkg/react" -> "react")
    * If load fails or is unsuccessful, reject the promise.
@@ -363,12 +363,7 @@ export interface PackageSource {
     options: {config: SnowpackConfig; lockfile: LockfileManifest | null},
   ): Promise<Buffer | string>;
   /** Resolve a package import to URL (ex: "react" -> "/pkg/react") */
-  resolvePackageImport(spec: string, importMap: ImportMap, config: SnowpackConfig): string | false;
-  /** Handle 1+ missing package imports before failing, if possible. */
-  recoverMissingPackageImport(
-    missingPackages: string[],
-    config: SnowpackConfig,
-  ): Promise<ImportMap>;
+  resolvePackageImport(source: string, spec: string, config: SnowpackConfig): string | false;
   /** Modify the build install config for optimized build install. */
   modifyBuildInstallOptions(options: {
     installOptions: EsinstallOptions;

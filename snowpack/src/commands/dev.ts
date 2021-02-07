@@ -81,12 +81,10 @@ import {
   isRemoteUrl,
   jsSourceMappingURL,
   openInBrowser,
-  parsePackageImportSpecifier,
   readFile,
   relativeURL,
   removeExtension,
   replaceExtension,
-  resolveDependencyManifest,
 } from '../util';
 import {getPort, getServerInfoMessage, paintDashboard, paintEvent} from './paint';
 import {getPackageSource} from '../sources/util';
@@ -325,7 +323,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     },
   });
 
-  let sourceImportMap = await pkgSource.prepare(commandOptions);
+  await pkgSource.prepare(commandOptions);
   const readCredentials = async (cwd: string) => {
     const [cert, key] = await Promise.all([
       fs.readFile(path.join(cwd, 'snowpack.crt')),
@@ -706,9 +704,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       fileLoc: string,
       responseExt: string,
       wrappedResponse: string,
-      retryMissing = true,
     ): Promise<string> {
-      let missingPackages: string[] = [];
       const resolveImportSpecifier = createImportResolver({
         fileLoc,
         config,
@@ -725,11 +721,10 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
           let resolvedImportUrl = resolveImportSpecifier(spec);
           // Handle a package import
           if (!resolvedImportUrl) {
-            resolvedImportUrl = pkgSource.resolvePackageImport(spec, sourceImportMap, config);
+            resolvedImportUrl = pkgSource.resolvePackageImport(fileLoc, spec, config);
           }
           // Handle a package import that couldn't be resolved
           if (!resolvedImportUrl) {
-            missingPackages.push(spec);
             return spec;
           }
           // Ignore "http://*" imports
@@ -760,43 +755,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
           return resolvedImportUrl;
         },
       );
-
-      // A missing package is a broken import, so we need to recover instantly if possible.
-      if (missingPackages.length > 0) {
-        // if retryMissing is true, do a fresh dependency install and then retry.
-        // Only retry once, to prevent an infinite loop when a package doesn't actually exist.
-        if (retryMissing) {
-          try {
-            sourceImportMap = await pkgSource.recoverMissingPackageImport(missingPackages, config);
-            return resolveResponseImports(fileLoc, responseExt, wrappedResponse, false);
-          } catch (err) {
-            const errorTitle = `Dependency Install Error`;
-            const errorMessage = err.message;
-            logger.error(`${errorTitle}: ${errorMessage}`);
-            hmrEngine.broadcastMessage({
-              type: 'error',
-              title: errorTitle,
-              errorMessage,
-              fileLoc,
-            });
-            return wrappedResponse;
-          }
-        }
-        // Otherwise, we need to send an error to the user, telling them about this issue.
-        // A failed retry usually means that Snowpack couldn't detect the import that the browser
-        // eventually saw post-build. In that case, you need to add it manually.
-        const errorTitle = `Error: Import "${missingPackages[0]}" could not be resolved.`;
-        const errorMessage = `If this import doesn't exist in the source file, add ${colors.bold(
-          `"knownEntrypoints": ["${missingPackages[0]}"]`,
-        )} to your Snowpack config "packageOptions".`;
-        logger.error(`${errorTitle}\n${errorMessage}`);
-        hmrEngine.broadcastMessage({
-          type: 'error',
-          title: errorTitle,
-          errorMessage,
-          fileLoc,
-        });
-      }
 
       let code = wrappedResponse;
       if (responseFileExt === '.js' && reqUrlHmrParam)
@@ -1341,29 +1299,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     onWatchEvent(fileLoc);
   });
 
-  // Watch node_modules & rerun snowpack install if symlinked dep updates
-  const symlinkedFileLocs = new Set(
-    Object.keys(sourceImportMap.imports)
-      .map((specifier) => {
-        const [packageName] = parsePackageImportSpecifier(specifier);
-        return resolveDependencyManifest(packageName, config.root);
-      }) // resolve symlink src location
-      .filter(([_, packageManifest]) => packageManifest && !packageManifest['_id']) // only watch symlinked deps for now
-      .map(([fileLoc]) => `${path.dirname(fileLoc!)}/**`),
-  );
-  function onDepWatchEvent() {
-    hmrEngine.broadcastMessage({type: 'reload'});
-  }
-  const depWatcher = chokidar.watch([...symlinkedFileLocs], {
-    cwd: '/', // we’re using absolute paths, so watch from root
-    persistent: true,
-    ignoreInitial: true,
-    disableGlobbing: false,
-    useFsEvents: isFsEventsEnabled(),
-  });
-  depWatcher.on('add', onDepWatchEvent);
-  depWatcher.on('change', onDepWatchEvent);
-  depWatcher.on('unlink', onDepWatchEvent);
+  //TODO: Watch symlinked node_modules (removed temporarily)
 
   const sp = {
     port,

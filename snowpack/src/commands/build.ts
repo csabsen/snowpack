@@ -20,7 +20,6 @@ import {EsmHmrEngine} from '../hmr-server-engine';
 import {logger} from '../logger';
 import {transformFileImports} from '../rewrite-imports';
 import {getInstallTargets} from '../scan-imports';
-import localPackageSource from '../sources/local';
 import {
   CommandOptions,
   ImportMap,
@@ -272,8 +271,13 @@ class FileBuilder {
         let resolvedImportUrl = resolveImportSpecifier(spec);
         // If not resolved, then this is a package. During build, dependencies are always
         // installed locally via esinstall, so use localPackageSource here.
-        if (importMap.imports[spec]) {
-          resolvedImportUrl = localPackageSource.resolvePackageImport(spec, importMap, this.config);
+        if (!resolvedImportUrl && importMap.imports[spec]) {
+          const importMapEntry = importMap.imports[spec];
+          resolvedImportUrl = path.posix.join(
+            this.config.buildOptions.metaUrlPath,
+            'pkg',
+            importMapEntry,
+          );
         }
         // If still not resolved, then this imported package somehow evaded detection
         // when we scanned it in the previous step. If you find a bug here, report it!

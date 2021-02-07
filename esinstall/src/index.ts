@@ -40,7 +40,6 @@ import {
 import {resolveEntrypoint, MAIN_FIELDS} from './entrypoints';
 
 export * from './types';
-export {resolveDependencyManifest} from './util';
 export {
   findExportMapEntry,
   findManifestEntry,

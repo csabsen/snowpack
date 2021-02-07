@@ -22,23 +22,15 @@ export function getUrlForFileMount({
   if (mountEntry.static) {
     return mountedUrl;
   }
-  return getBuiltFileUrl(mountedUrl, config);
-}
-
-/**
- * Map a file path to the hosted URL for a given "mount" entry.
- */
-export function getBuiltFileUrl(filepath: string, config: SnowpackConfig): string {
-  const fileName = path.basename(filepath);
   const extensionMatch = getExtensionMatch(fileName, config._extensionMap);
   if (!extensionMatch) {
-    return filepath;
+    return mountedUrl;
   }
   const [inputExt, outputExts] = extensionMatch;
   if (outputExts.length > 1) {
-    return addExtension(filepath, outputExts[0]);
+    return addExtension(mountedUrl, outputExts[0]);
   } else {
-    return replaceExtension(filepath, inputExt, outputExts[0]);
+    return replaceExtension(mountedUrl, inputExt, outputExts[0]);
   }
 }
 

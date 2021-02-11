@@ -744,7 +744,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
           }
           // Handle normal "./" & "../" import specifiers
           const importExtName = path.posix.extname(resolvedImportUrl);
-          const isProxyImport = importExtName && importExtName !== '.js';
+          const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs'; 
           const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
           if (isProxyImport) {
             resolvedImportUrl = resolvedImportUrl + '.proxy.js';

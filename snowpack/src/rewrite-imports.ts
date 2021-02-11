@@ -118,3 +118,12 @@ export async function transformFileImports(
     `Incompatible filetype: cannot scan ${baseExt} files for ESM imports. This is most likely an error within Snowpack.`,
   );
 }
+
+export async function transformAddMissingDefaultExport(_code: string) {
+  // We need to add a default export, just so that our re-importer doesn't break
+  const [, allExports] = await parse(_code);
+  if (!allExports.includes('default')) {
+    return _code + '\n\nexport default null;';
+  }
+  return _code;
+}

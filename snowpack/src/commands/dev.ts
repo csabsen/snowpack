@@ -464,11 +464,23 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       };
     }
 
+    let requestedFile = path.parse(reqPath);
+    let requestedFileExt = requestedFile.ext.toLowerCase();
+    let responseFileExt = requestedFileExt;
+    let isRoute = !requestedFileExt || requestedFileExt === '.html';
+
     if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
       try {
         const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
         const loadedModule = await pkgSource.load(webModuleUrl, commandOptions);
         let code = loadedModule;
+        // Resolve imports.
+        // TODO: only resolve imports for JS, HTML, and CSS
+        code = await resolveResponseImports(
+            path.join(config.root, 'VIRTUAL.js'),
+            '.js',
+            code as string,
+          );
         if (isProxyModule) {
           code = await wrapImportProxy({url: reqPath, code: code.toString(), hmr: isHMR, config});
         }
@@ -510,11 +522,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         .then((stat) => (stat.isFile() ? requestedFile : null))
         .catch(() => null /* ignore */);
     }
-
-    let requestedFile = path.parse(reqPath);
-    let requestedFileExt = requestedFile.ext.toLowerCase();
-    let responseFileExt = requestedFileExt;
-    let isRoute = !requestedFileExt || requestedFileExt === '.html';
 
     async function getFileFromMount(
       requestedFile: string,

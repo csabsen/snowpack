@@ -9,7 +9,7 @@ import path from 'path';
 import rimraf from 'rimraf';
 import util from 'util';
 import {logger} from '../logger';
-import {transformEsmImports} from '../rewrite-imports';
+import {transformAddMissingDefaultExport, transformEsmImports} from '../rewrite-imports';
 import {getInstallTargets} from '../scan-imports';
 import {CommandOptions, PackageSource, SnowpackConfig} from '../types';
 import {GLOBAL_CACHE_DIR, replaceExtension} from '../util';
@@ -24,12 +24,6 @@ const PROJECT_CACHE_DIR =
 
 const DEV_DEPENDENCIES_DIR = path.join(PROJECT_CACHE_DIR, process.env.NODE_ENV || 'development');
 
-function getWebDependencyName(dep: string): string {
-  return validatePackageName(dep).validForNewPackages
-    ? dep.replace(/\.js$/i, 'js') // if this is a top-level package ending in .js, replace with js (e.g. tippy.js -> tippyjs)
-    : dep.replace(/\.m?js$/i, ''); // otherwise simply strip the extension (Rollup will resolve it)
-}
-
 /**
  * Sanitizes npm packages that end in .js (e.g `tippy.js` -> `tippyjs`).
  * This is necessary because Snowpack can’t create both a file and directory
@@ -40,7 +34,6 @@ export function sanitizePackageName(filepath: string): string {
   const file = dirs.pop() as string;
   return [...dirs.map((path) => path.replace(/\.js$/i, 'js')), file].join('/');
 }
-
 
 function getRootPackageDirectory(loc: string) {
   const parts = loc.split('node_modules');
@@ -62,29 +55,62 @@ let config: SnowpackConfig;
 
 let installTargets: InstallTarget[] = [];
 const allHashes: Record<string, string> = {};
-const allSpecs: Record<string, string> = {};
 const inProgress = new PQueue({concurrency: 1});
 /**
  * Local Package Source: A generic interface through which Snowpack
  * interacts with esinstall and your locally installed dependencies.
  */
 export default {
-  async load(id: string): Promise<Buffer> {
+  async load(id: string): Promise<Buffer | string> {
     const idParts = id.split('/');
-    idParts.shift();
     let packageInfo = idParts.shift()!;
     if (packageInfo?.startsWith('@')) {
       packageInfo += '/' + idParts.shift();
     }
-    const hash = idParts.shift()!;
+    const [, hash] = idParts.shift()!.split(':');
     const packageInfoParts = packageInfo.split('@');
     const packageVersion = packageInfoParts.pop()!;
     const packageName = packageInfoParts.join('@');
-    const spec = allSpecs[idParts.join('/')];
-    const entrypoint = allHashes[hash];
     const installDest = path.join(DEV_DEPENDENCIES_DIR, packageInfo);
+    const isLookup = idParts[0] !== '-';
+    if (!isLookup) {
+      idParts.shift();
+    } else {
+      idParts.unshift(packageName);
+    }
+    const spec = idParts.join('/');
+    const specInternal = idParts.join('/');
+    const entrypoint = allHashes[hash];
+    const entrypointPackageManifestLoc = getRootPackageDirectory(entrypoint) + '/package.json';
+    const importMap =
+      existsSync(installDest) &&
+      JSON.parse((await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!);
+    console.log(isLookup, idParts, installDest, importMap, spec, entrypointPackageManifestLoc);
 
-    console.log(allSpecs, idParts, spec);
+    if (importMap) {
+      if (isLookup && importMap.imports[spec]) {
+        const finalLocation = path.posix.join(
+          config.buildOptions.metaUrlPath,
+          'pkg',
+          `${packageName}@${packageVersion}`,
+          `local:${hash}`,
+          `-`,
+          importMap.imports[spec],
+        );
+        return `export * from "${finalLocation}"; export {default} from "${finalLocation}";`;
+      }
+      if (!isLookup) {
+        const dependencyFileLoc = path.join(installDest, spec);
+        let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
+        installedPackageCode = await transformAddMissingDefaultExport(installedPackageCode);
+        // TODO: Always pass the result through our normal build pipeline, for unbundled packages and such
+        return installedPackageCode;
+      }
+    }
+
+    // const builtAsset = getBuiltFileUrl(entrypoint, config); //, path.extname(spec), path.extname(builtAsset));
+
+    console.log(idParts, spec);
     return inProgress.add(async () => {
       let installEntrypoints = [
         spec,
@@ -95,20 +121,7 @@ export default {
       console.log('installEntrypoints', packageName, installTargets, installEntrypoints);
       let dependencyFileLoc: string | undefined;
       console.time(spec);
-      if (existsSync(installDest)) {
-        const importMap = JSON.parse(
-          (await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!,
-        );
-        installEntrypoints = Object.keys(importMap.imports);
-        if (importMap.imports[spec]) {
-          dependencyFileLoc = path.join(installDest, importMap.imports[spec]);
-        } else {
-          installEntrypoints.push(spec);
-        }
-      }
-      const entrypointPackageManifestLoc = (await findUp('package.json', {
-        cwd: path.dirname(entrypoint),
-      })) as string;
+      const entrypointPackageManifestLoc = getRootPackageDirectory(entrypoint) + '/package.json';
       const entrypointPackageManifest = JSON.parse(
         await fs.readFile(entrypointPackageManifestLoc, 'utf8'),
       );
@@ -139,12 +152,7 @@ export default {
       console.timeEnd(spec);
       const installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
       // TODO: Always pass the result through our normal build pipeline, for unbundled packages and such
-      const processedCode = await transformEsmImports(installedPackageCode, (_spec) => {
-        if (_spec.startsWith('./') || _spec.startsWith('../')) {
-          return _spec;
-        }
-        return this.resolvePackageImport(entrypointPackageManifestLoc, _spec, config) as string;
-      });
+      const processedCode = installedPackageCode;
       return Buffer.from(processedCode);
     });
   },
@@ -205,16 +213,13 @@ export default {
       readFileSync(entrypointPackageManifestLoc!, 'utf8'),
     );
     const hash = crypto.createHash('md5').update(rootPackageDirectory).digest('hex');
-    const builtAsset = getBuiltFileUrl(entrypoint, config);
-    const finalSpec = replaceExtension(spec, path.extname(spec), path.extname(builtAsset));
+    const finalSpec = spec.replace(entrypointPackageManifest.name, '').replace(/^\//, '');
     allHashes[hash] = entrypoint;
-    allSpecs[finalSpec] = spec;
     return path.posix.join(
       config.buildOptions.metaUrlPath,
       'pkg',
-      'local',
       `${entrypointPackageManifest.name}@${entrypointPackageManifest.version}`,
-      hash,
+      `local:${hash}`,
       finalSpec,
     );
   },

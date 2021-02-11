@@ -71,7 +71,6 @@ export default {
     const packageInfoParts = packageInfo.split('@');
     const packageVersion = packageInfoParts.pop()!;
     const packageName = packageInfoParts.join('@');
-    const installDest = path.join(DEV_DEPENDENCIES_DIR, packageInfo);
     const isLookup = idParts[0] !== '-';
     if (!isLookup) {
       idParts.shift();
@@ -82,30 +81,30 @@ export default {
     const specInternal = idParts.join('/');
     const entrypoint = allHashes[hash];
     const entrypointPackageManifestLoc = getRootPackageDirectory(entrypoint) + '/package.json';
+    const installDest = path.join(DEV_DEPENDENCIES_DIR, packageInfo);
     const importMap =
       existsSync(installDest) &&
       JSON.parse((await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!);
     console.log(isLookup, idParts, installDest, importMap, spec, entrypointPackageManifestLoc);
 
-    if (importMap) {
-      if (isLookup && importMap.imports[spec]) {
-        const finalLocation = path.posix.join(
-          config.buildOptions.metaUrlPath,
-          'pkg',
-          `${packageName}@${packageVersion}`,
-          `local:${hash}`,
-          `-`,
-          importMap.imports[spec],
-        );
-        return `export * from "${finalLocation}"; export {default} from "${finalLocation}";`;
-      }
-      if (!isLookup) {
-        const dependencyFileLoc = path.join(installDest, spec);
-        let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
-        installedPackageCode = await transformAddMissingDefaultExport(installedPackageCode);
-        // TODO: Always pass the result through our normal build pipeline, for unbundled packages and such
-        return installedPackageCode;
-      }
+    if (!isLookup) {
+      const dependencyFileLoc = path.join(installDest, spec);
+      let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
+      installedPackageCode = await transformAddMissingDefaultExport(installedPackageCode);
+      // TODO: Always pass the result through our normal build pipeline, for unbundled packages and such
+      return installedPackageCode;
+    }
+
+    if (isLookup && importMap && importMap.imports[spec]) {
+      const finalLocation = path.posix.join(
+        config.buildOptions.metaUrlPath,
+        'pkg',
+        `${packageName}@${packageVersion}`,
+        `local:${hash}`,
+        `-`,
+        importMap.imports[spec],
+      );
+      return `export * from "${finalLocation}"; export {default} from "${finalLocation}";`;
     }
 
     // const builtAsset = getBuiltFileUrl(entrypoint, config); //, path.extname(spec), path.extname(builtAsset));
@@ -212,9 +211,26 @@ export default {
     const entrypointPackageManifest = JSON.parse(
       readFileSync(entrypointPackageManifestLoc!, 'utf8'),
     );
+
     const hash = crypto.createHash('md5').update(rootPackageDirectory).digest('hex');
     const finalSpec = spec.replace(entrypointPackageManifest.name, '').replace(/^\//, '');
     allHashes[hash] = entrypoint;
+
+    const installDest = path.join(DEV_DEPENDENCIES_DIR, entrypointPackageManifest.name);
+    const importMap =
+      existsSync(installDest) &&
+      JSON.parse(readFileSync(path.join(installDest, 'import-map.json'), 'utf8')!);
+    if (importMap && importMap.imports[spec]) {
+      return path.posix.join(
+        config.buildOptions.metaUrlPath,
+        'pkg',
+        `${entrypointPackageManifest.name}@${entrypointPackageManifest.version}`,
+        `local:${hash}`,
+        '-',
+        importMap.imports[spec],
+      );
+    }
+
     return path.posix.join(
       config.buildOptions.metaUrlPath,
       'pkg',

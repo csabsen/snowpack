@@ -1,3 +1,5 @@
+import {buildFile} from '../build/build-pipeline';
+import url from 'url';
 import etag from 'etag';
 import crypto from 'crypto';
 import {install as esinstall, InstallTarget, resolveEntrypoint} from 'esinstall';
@@ -7,6 +9,7 @@ import PQueue from 'p-queue';
 import path from 'path';
 import rimraf from 'rimraf';
 import util from 'util';
+import type {Plugin as RollupPlugin} from 'rollup';
 import {logger} from '../logger';
 import {transformAddMissingDefaultExport} from '../rewrite-imports';
 import {getInstallTargets} from '../scan-imports';
@@ -37,7 +40,6 @@ function getRootPackageDirectory(loc: string) {
   const parts = loc.split('node_modules');
   const packageParts = parts.pop()!.split('/').filter(Boolean);
   const packageRoot = path.join(parts.join('node_modules'), 'node_modules');
-  console.log(packageRoot, packageParts);
   if (packageParts[0].startsWith('@')) {
     return path.join(packageRoot, packageParts[0], packageParts[1]);
   } else {
@@ -61,13 +63,16 @@ const inProgress = new PQueue({concurrency: 1});
 export default {
   async load(id: string): Promise<Buffer | string> {
     const idParts = id.split('/');
-    const hash = idParts.shift()!;
+    let hash = idParts.shift()!;
     const isLookup = idParts[0] !== '-';
     if (!isLookup) {
       idParts.shift();
     }
-
-
+    console.log(allHashes, hash);
+    const isRaw = hash.startsWith('raw:');
+    if (isRaw) {
+      hash = hash.replace('raw:', 'local:');
+    }
     const rootPackageDirectory = allHashes[hash];
     const entrypointPackageManifestLoc = path.join(rootPackageDirectory, 'package.json');
     const entrypointPackageManifestStr = await fs.readFile(entrypointPackageManifestLoc, 'utf8');
@@ -77,8 +82,11 @@ export default {
     const spec = idParts.join('/');
     const internalSpec = spec.replace(packageName + '/', '');
 
-    if (packageName === 'svelte') {
-      let installedPackageCode = await fs.readFile(path.join(rootPackageDirectory, internalSpec), 'utf8');
+    if (isRaw) {
+      let installedPackageCode = await fs.readFile(
+        path.join(rootPackageDirectory, internalSpec),
+        'utf8',
+      );
       return installedPackageCode;
     }
     const installDest = path.join(
@@ -97,14 +105,6 @@ export default {
     const importMap =
       existsAndIsValid &&
       JSON.parse((await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!);
-    console.log(
-      spec,
-      isLookup,
-      importMap,
-      existsAndIsValid,
-      etag(entrypointPackageManifestStr),
-      await fs.readFile(path.join(installDest, '.hash'), 'utf-8').catch((err) => null),
-    );
 
     if (!isLookup) {
       await inProgress.onIdle();
@@ -127,7 +127,6 @@ export default {
       return `export * from "${finalLocation}"; export {default} from "${finalLocation}";`;
     }
 
-    console.log(idParts, spec);
     return inProgress.add(async () => {
       const importMap =
         existsSync(installDest) &&
@@ -142,7 +141,6 @@ export default {
             .filter((t) => t === packageName || t.startsWith(packageName + '/')),
         ]),
       );
-      console.log('installEntrypoints', packageName, installTargets, installEntrypoints);
       console.time(spec);
       // TODO: external should be a function in esinstall
       const external = [
@@ -163,6 +161,39 @@ export default {
           log: (...args: [any, ...any[]]) => logger.info(util.format(...args)),
           warn: (...args: [any, ...any[]]) => logger.warn(util.format(...args)),
           error: (...args: [any, ...any[]]) => logger.error(util.format(...args)),
+        },
+        packageExportLookupFields: ['svelte'],
+        packageLookupFields: ['svelte'],
+        rollup: {
+          plugins: [
+            {
+              name: 'esinstall:snowpack',
+              resolveId(source: string, importer: string | undefined) {
+                console.log('resolveId', source, importer);
+                return source;
+              },
+              async load(id: string) {
+                console.log('load', id);
+                const output = await buildFile(url.pathToFileURL(id), {
+                  config,
+                  isDev: true,
+                  isSSR: false,
+                  isHmrEnabled: false,
+                });
+                let jsResponse;
+                // console.log(output);
+                for (const [outputType, outputContents] of Object.entries(output)) {
+                  if (jsResponse) {
+                    console.log(`load() Err: ${Object.keys(output)}`);
+                  }
+                  if (!jsResponse || outputType === '.js') {
+                    jsResponse = outputContents;
+                  }
+                }
+                return jsResponse;
+              },
+            } as RollupPlugin,
+          ],
         },
       });
       await fs.writeFile(
@@ -227,13 +258,11 @@ export default {
   },
 
   resolvePackageImport(source: string, spec: string, config: SnowpackConfig): string | false {
-    console.log('START', spec, source);
     const entrypoint = resolveEntrypoint(spec, {
       cwd: path.dirname(source),
-      packageLookupFields: [],
+      packageLookupFields: ['svelte'],
     });
     const rootPackageDirectory = getRootPackageDirectory(entrypoint);
-    console.log('rootPackageDirectory', rootPackageDirectory);
     const entrypointPackageManifestLoc = path.join(rootPackageDirectory, 'package.json');
     const entrypointPackageManifest = JSON.parse(
       readFileSync(entrypointPackageManifestLoc!, 'utf8'),
@@ -263,10 +292,22 @@ export default {
     //   );
     // }
 
-
-    if (spec === 'svelte' || spec.startsWith('svelte/')) {
-    return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', hash, entrypoint.replace(rootPackageDirectory, 'svelte'));
-    }
+    // if (spec === 'svelte' || spec.startsWith('svelte/')) {
+    //   return path.posix.join(
+    //     config.buildOptions.metaUrlPath,
+    //     'pkg',
+    //     hash.replace('local:', 'raw:'),
+    //     entrypoint.replace(rootPackageDirectory, 'svelte'),
+    //   );
+    // }
+    // if (spec === 'svelte-awesome' || spec.startsWith('svelte-awesome/')) {
+    //   return path.posix.join(
+    //     config.buildOptions.metaUrlPath,
+    //     'pkg',
+    //     hash.replace('local:', 'raw:'),
+    //     entrypoint.replace(rootPackageDirectory, 'svelte-awesome'),
+    //   );
+    // }
 
     return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', hash, spec);
   },

@@ -35,7 +35,7 @@ import http2 from 'http2';
 import {isBinaryFile} from 'isbinaryfile';
 import * as colors from 'kleur/colors';
 import mime from 'mime-types';
-import os from 'os';
+import os, {tmpdir} from 'os';
 import path from 'path';
 import {performance} from 'perf_hooks';
 import onProcessExit from 'signal-exit';
@@ -88,6 +88,8 @@ import {
 } from '../util';
 import {getPort, getServerInfoMessage, paintDashboard, paintEvent} from './paint';
 import {getPackageSource} from '../sources/util';
+import mkdirp from 'mkdirp';
+import rimraf from 'rimraf';
 
 interface FoundFile {
   fileLoc: string;
@@ -235,6 +237,7 @@ function handleResponseError(req, res, err: Error | NotFoundError) {
     sendResponseError(req, res, 404);
     return;
   }
+  console.log(err);
   logger.error(err.toString());
   logger.error(`[500] ${req.url}`, {
     // @ts-ignore
@@ -266,6 +269,13 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
   const {config} = commandOptions;
   // Start the startup timer!
   let serverStart = performance.now();
+
+  const VIRTUAL_URL_DISK_CACHE = path.join(
+    config.root,
+    'node_modules',
+    '.cache',
+    'snowpack-super-temp',
+  );
 
   const {port: defaultPort, hostname, open} = config.devOptions;
   const messageBus = new EventEmitter();
@@ -466,50 +476,11 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
 
     let requestedFile = path.parse(reqPath);
     let requestedFileExt = requestedFile.ext.toLowerCase();
+    if (requestedFileExt === '.mjs') {
+      requestedFileExt = '.js';
+    }
     let responseFileExt = requestedFileExt;
     let isRoute = !requestedFileExt || requestedFileExt === '.html';
-
-    if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
-      try {
-        const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
-        const loadedModule = await pkgSource.load(webModuleUrl, commandOptions);
-        let code = loadedModule;
-        // Resolve imports.
-        // TODO: only resolve imports for JS, HTML, and CSS
-        code = await resolveResponseImports(
-            path.join(config.root, 'VIRTUAL.js'),
-            '.js',
-            code as string,
-          );
-        if (isProxyModule) {
-          code = await wrapImportProxy({url: reqPath, code: code.toString(), hmr: isHMR, config});
-        }
-        let contentType = path.extname(originalReqPath)
-          ? mime.lookup(path.extname(originalReqPath))
-          : 'application/javascript';
-        // We almost never want an 'application/octet-stream' response, so just
-        // convert to JS until we have proper "raw" handling in the URL for non-JS responses.
-        if (contentType === 'application/octet-stream') {
-          contentType = 'application/javascript';
-        }
-        return {
-          contents: encodeResponse(code, encoding),
-          originalFileLoc: null,
-          contentType,
-        };
-      } catch (err) {
-        const errorTitle = `Dependency Load Error`;
-        const errorMessage = err.message;
-        logger.error(`${errorTitle}: ${errorMessage}`);
-        hmrEngine.broadcastMessage({
-          type: 'error',
-          title: errorTitle,
-          errorMessage,
-          fileLoc: reqPath,
-        });
-        throw err;
-      }
-    }
 
     const attemptedFileLoads: string[] = [];
     function attemptLoadFile(requestedFile): Promise<null | string> {
@@ -592,9 +563,30 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       return null;
     }
 
-    let foundFile = await getFileFromUrl(reqPath);
-    if (!foundFile && isRoute) {
-      foundFile = await getFileFromLazyUrl(reqPath);
+    async function getFileFromDependency(reqPath: string): Promise<FoundFile | null> {
+      const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
+      const loadedModule = await pkgSource.load(webModuleUrl, commandOptions);
+      // TODO: Sneaky hack! This will only work on unix
+        await mkdirp(path.dirname(VIRTUAL_URL_DISK_CACHE + reqPath));
+      await fs.writeFile(VIRTUAL_URL_DISK_CACHE + reqPath + '.js', loadedModule);
+      requestedFileExt = '.js';
+      responseFileExt = '.js';
+      isRoute = false;
+      return {
+        fileLoc: VIRTUAL_URL_DISK_CACHE + reqPath + '.js',
+        isStatic: false,
+        isResolve: true,
+      };
+    }
+
+    let foundFile: FoundFile | null = null;
+    if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
+      foundFile = await getFileFromDependency(reqPath);
+    } else {
+      foundFile = await getFileFromUrl(reqPath);
+      if (!foundFile && isRoute) {
+        foundFile = await getFileFromLazyUrl(reqPath);
+      }
     }
 
     if (!foundFile) {
@@ -606,7 +598,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       const cleanUrlWithMainExtension =
         cleanUrl && replaceExtension(cleanUrl, path.extname(cleanUrl), '.js');
       const expectedUrl = getUrlForFile(foundFile.fileLoc, config);
-      if (cleanUrl !== expectedUrl && cleanUrlWithMainExtension !== expectedUrl) {
+      if (expectedUrl && cleanUrl !== expectedUrl && cleanUrlWithMainExtension !== expectedUrl) {
         logger.warn(`Bad Request: "${reqUrl}" should be requested as "${expectedUrl}".`);
         throw new NotFoundError([foundFile.fileLoc]);
       }
@@ -744,7 +736,8 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
           }
           // Handle normal "./" & "../" import specifiers
           const importExtName = path.posix.extname(resolvedImportUrl);
-          const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs'; 
+          const isProxyImport =
+            importExtName && importExtName !== '.js' && importExtName !== '.mjs';
           const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
           if (isProxyImport) {
             resolvedImportUrl = resolvedImportUrl + '.proxy.js';
@@ -1011,6 +1004,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     try {
       responseContent = await finalizeResponse(fileLoc, requestedFileExt, responseOutput);
     } catch (err) {
+        console.log(err);
       logger.error(FILE_BUILD_RESULT_ERROR);
       hmrEngine.broadcastMessage({
         type: 'error',

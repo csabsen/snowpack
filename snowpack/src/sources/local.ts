@@ -169,11 +169,11 @@ export default {
             {
               name: 'esinstall:snowpack',
               resolveId(source: string, importer: string | undefined) {
-                console.log('resolveId', source, importer);
+                // console.log('resolveId', source, importer);
                 return source;
               },
               async load(id: string) {
-                console.log('load', id);
+                // console.log('load', id);
                 const output = await buildFile(url.pathToFileURL(id), {
                   config,
                   isDev: true,

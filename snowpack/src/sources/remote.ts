@@ -165,7 +165,8 @@ export default {
     return body;
   },
 
-  resolvePackageImport(source: string, spec: string, config: SnowpackConfig): string {
+  // TODO: Remove need for lookup URLs
+  async resolvePackageImport(source: string, spec: string, config: SnowpackConfig) {
     return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', spec);
   },
 

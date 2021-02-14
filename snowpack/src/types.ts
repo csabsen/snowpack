@@ -363,7 +363,7 @@ export interface PackageSource {
     options: {config: SnowpackConfig; lockfile: LockfileManifest | null},
   ): Promise<Buffer | string>;
   /** Resolve a package import to URL (ex: "react" -> "/pkg/react") */
-  resolvePackageImport(source: string, spec: string, config: SnowpackConfig): string | false;
+  resolvePackageImport(source: string, spec: string, config: SnowpackConfig): Promise<string | false>;
   /** Modify the build install config for optimized build install. */
   modifyBuildInstallOptions(options: {
     installOptions: EsinstallOptions;

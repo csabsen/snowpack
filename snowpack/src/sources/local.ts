@@ -99,7 +99,7 @@ export default {
     const entrypointPackageManifestStr = await fs.readFile(entrypointPackageManifestLoc, 'utf8');
     const entrypointPackageManifest = JSON.parse(entrypointPackageManifestStr);
     const packageName = entrypointPackageManifest.name;
-    
+
     const spec = idParts.join('/');
     const internalSpec = spec.replace(packageName + '/', '');
     console.log('A', spec, internalSpec);
@@ -352,7 +352,8 @@ export default {
     // }
   },
 
-  resolvePackageImport(source: string, spec: string, config: SnowpackConfig): string | false {
+  // TODO: Make async, and then clean all of this up
+  async resolvePackageImport(source: string, spec: string, config: SnowpackConfig) {
     const entrypoint = resolveEntrypoint(spec, {
       cwd: path.dirname(source),
       packageLookupFields: ['svelte'],
@@ -365,7 +366,7 @@ export default {
       readFileSync(entrypointPackageManifestLoc!, 'utf8'),
     );
     const {name: packageName, version: packageVersion} = entrypointPackageManifest;
-    const hash = packageName+'@'+packageVersion;
+    const hash = packageName + '@' + packageVersion;
     allHashes[hash] = allHashes[hash] || rootPackageDirectory;
 
     // const hash =
@@ -408,7 +409,6 @@ export default {
     //     entrypoint.replace(rootPackageDirectory, 'svelte-awesome'),
     //   );
     // }
-
 
     console.log(allHashes);
     return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', hash, spec);

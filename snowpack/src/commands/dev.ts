@@ -460,12 +460,12 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         fileLoc: this.loc,
         config,
       });
-      contents = await transformFileImports({type, contents}, (spec) => {
+      contents = await transformFileImports({type, contents}, async (spec) => {
         // Try to resolve the specifier to a known URL in the project
         let resolvedImportUrl = resolveImportSpecifier(spec);
         // Handle a package import
         if (!resolvedImportUrl) {
-          resolvedImportUrl = pkgSource.resolvePackageImport(this.loc, spec, config);
+          resolvedImportUrl = await pkgSource.resolvePackageImport(this.loc, spec, config);
         }
         // Handle a package import that couldn't be resolved
         if (!resolvedImportUrl) {

@@ -71,6 +71,9 @@ export default {
     const PACKAGE_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'pkg/');
     const idParts = id.split('/');
     let hash = idParts.shift()!;
+    if (hash.startsWith('@')) {
+      hash += '/' + idParts.shift()!;
+    }
     const isLookup = idParts[0] !== '-';
     if (!isLookup) {
       idParts.shift();
@@ -80,23 +83,26 @@ export default {
       hash = hash.replace('raw:', 'local:');
     }
 
-    const spec = idParts.join('/');
-    let packageName = idParts.shift()!;
-    if (packageName.startsWith('@')) {
-      packageName += '/' + idParts.shift()!;
-    }
-    if (packageName.endsWith('.js') && !isLookup) {
-      packageName = packageName.replace(/\.js$/, '');
-    }
-    const internalSpec = idParts.join('/');
-    console.log('A', spec, internalSpec);
-    const rootNodeModulesDirectory = allHashes[hash];
-    const rootPackageDirectory = path.join(rootNodeModulesDirectory, packageName);
+    // const spec = idParts.join('/');
+    // let packageName = idParts.shift()!;
+    // if (packageName.startsWith('@')) {
+    //   packageName += '/' + idParts.shift()!;
+    // }
+    // if (packageName.endsWith('.js') && !isLookup) {
+    //   packageName = packageName.replace(/\.js$/, '');
+    // }
+    // const internalSpec = idParts.join('/');
+    const rootPackageDirectory = allHashes[hash];
+    console.log(hash, allHashes);
+    // const rootPackageDirectory = path.join(rootNodeModulesDirectory, packageName);
     const entrypointPackageManifestLoc = path.join(rootPackageDirectory, 'package.json');
     const entrypointPackageManifestStr = await fs.readFile(entrypointPackageManifestLoc, 'utf8');
     const entrypointPackageManifest = JSON.parse(entrypointPackageManifestStr);
-    // const packageName = entrypointPackageManifest.name;
-
+    const packageName = entrypointPackageManifest.name;
+    
+    const spec = idParts.join('/');
+    const internalSpec = spec.replace(packageName + '/', '');
+    console.log('A', spec, internalSpec);
 
     if (isRaw) {
       let installedPackageCode = await fs.readFile(
@@ -113,7 +119,7 @@ export default {
 
     if (
       etag(entrypointPackageManifestStr) !==
-      (await fs.readFile(path.join(installDest, '.meta'), 'utf-8').catch((err) => null))
+      (await fs.readFile(path.join(installDest, '.meta'), 'utf-8').catch(() => null))
     ) {
       existsAndIsValid = false;
     }
@@ -358,12 +364,15 @@ export default {
     const entrypointPackageManifest = JSON.parse(
       readFileSync(entrypointPackageManifestLoc!, 'utf8'),
     );
+    const {name: packageName, version: packageVersion} = entrypointPackageManifest;
+    const hash = packageName+'@'+packageVersion;
+    allHashes[hash] = allHashes[hash] || rootPackageDirectory;
 
-    const hash =
-      'local' +
-      ':' +
-      crypto.createHash('md5').update(rootNodeModulesDirectory).digest('hex').substr(0, 16);
-    allHashes[hash] = rootNodeModulesDirectory;
+    // const hash =
+    //   'local' +
+    //   ':' +
+    //   crypto.createHash('md5').update(rootNodeModulesDirectory).digest('hex').substr(0, 16);
+    // allHashes[hash] = rootNodeModulesDirectory;
 
     // const installDest = path.join(
     //   DEV_DEPENDENCIES_DIR,
@@ -399,6 +408,7 @@ export default {
     //     entrypoint.replace(rootPackageDirectory, 'svelte-awesome'),
     //   );
     // }
+
 
     console.log(allHashes);
     return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', hash, spec);

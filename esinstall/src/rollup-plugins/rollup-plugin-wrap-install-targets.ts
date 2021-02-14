@@ -119,6 +119,7 @@ export function rollupPluginWrapInstallTargets(
     buildStart(inputOptions) {
       const input = inputOptions.input as {[entryAlias: string]: string};
       for (const [key, val] of Object.entries(input)) {
+        console.log(key, val);
         if (isRemoteUrl(val)) {
           continue;
         }
@@ -140,6 +141,7 @@ export function rollupPluginWrapInstallTargets(
         const isExplicitAutoDetect = autoDetectPackageExports.some((p) =>
           normalizedFileLoc.includes(`node_modules/${p}${p.endsWith('.js') ? '' : '/'}`),
         );
+
         const cjsExports = isExplicitAutoDetect
           ? cjsAutoDetectExportsTrusted(val)
           : cjsAutoDetectExportsUntrusted(val);

@@ -11,10 +11,10 @@ import rimraf from 'rimraf';
 import util from 'util';
 import type {Plugin as RollupPlugin} from 'rollup';
 import {logger} from '../logger';
-import {transformAddMissingDefaultExport} from '../rewrite-imports';
+import {transformAddMissingDefaultExport, transformFileImports} from '../rewrite-imports';
 import {getInstallTargets} from '../scan-imports';
 import {CommandOptions, PackageSource, SnowpackConfig} from '../types';
-import {GLOBAL_CACHE_DIR} from '../util';
+import {GLOBAL_CACHE_DIR, isRemoteUrl} from '../util';
 
 const PROJECT_CACHE_DIR =
   projectCacheDir({name: 'snowpack'}) ||
@@ -102,35 +102,42 @@ export default {
       existsAndIsValid = false;
     }
 
-    const importMap =
-      existsAndIsValid &&
-      JSON.parse((await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!);
-
     if (!isLookup) {
       await inProgress.onIdle();
       const dependencyFileLoc = path.join(installDest, spec);
       let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
       installedPackageCode = await transformAddMissingDefaultExport(installedPackageCode);
-      // TODO: Always pass the result through our normal build pipeline, for unbundled packages and such
-      return installedPackageCode;
-    }
-
-    if (isLookup && importMap && importMap.imports[spec]) {
-      await inProgress.onIdle();
-      const finalLocation = path.posix.join(
-        config.buildOptions.metaUrlPath,
-        'pkg',
-        hash,
-        `-`,
-        importMap.imports[spec],
+      installedPackageCode = await transformFileImports(
+        {type: path.extname(dependencyFileLoc), contents: installedPackageCode},
+        (spec) => {
+          if (isRemoteUrl(spec)) {
+            return spec;
+          }
+          if (spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/')) {
+            return spec;
+          }
+          return this.resolvePackageImport(entrypointPackageManifestLoc, spec, config) || spec;
+        },
       );
-      return `export * from "${finalLocation}"; export {default} from "${finalLocation}";`;
+      return installedPackageCode;
     }
 
     return inProgress.add(async () => {
       const importMap =
         existsSync(installDest) &&
         JSON.parse((await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!);
+
+      if (importMap && importMap.imports[spec]) {
+        const finalLocation = path.posix.join(
+          config.buildOptions.metaUrlPath,
+          'pkg',
+          hash,
+          `-`,
+          importMap.imports[spec],
+        );
+        return `export * from "${finalLocation}"; export {default} from "${finalLocation}";`;
+      }
+
       const existingEntrypoints = importMap ? Object.keys(importMap.imports) : [];
       let installEntrypoints = Array.from(
         new Set([
@@ -141,6 +148,7 @@ export default {
             .filter((t) => t === packageName || t.startsWith(packageName + '/')),
         ]),
       );
+      console.log('START', installEntrypoints);
       console.time(spec);
       // TODO: external should be a function in esinstall
       const external = [
@@ -271,7 +279,7 @@ export default {
     const hash =
       'local' +
       ':' +
-      crypto.createHash('md5').update(rootPackageDirectory).digest('hex').substr(0, 12);
+      crypto.createHash('md5').update(rootPackageDirectory).digest('hex').substr(0, 16);
     allHashes[hash] = rootPackageDirectory;
 
     // const installDest = path.join(

@@ -9,8 +9,9 @@ import {command as devCommand} from './commands/dev';
 import {clearCache} from './sources/util';
 import {logger} from './logger';
 import {loadConfiguration, expandCliFlags} from './config';
-import {CLIFlags, CommandOptions} from './types';
+import {CLIFlags, CommandOptions, SnowpackConfig} from './types';
 import {readLockfile} from './util.js';
+import {getUrlsForFile} from './build/file-urls';
 export * from './types';
 
 // Stable API
@@ -18,11 +19,14 @@ export {startServer} from './commands/dev';
 export {build} from './commands/build';
 export {loadConfiguration, createConfiguration} from './config.js';
 export {readLockfile as loadLockfile} from './util.js';
-export {getUrlForFile} from './build/file-urls';
 export {clearCache} from './sources/util';
 export {logger} from './logger';
 
 // Deprecated API
+export function getUrlForFile(fileLoc: string, config: SnowpackConfig) {
+  const result = getUrlsForFile(fileLoc, config);
+  return result ? result[0] : result;
+}
 export function startDevServer() {
   throw new Error('startDevServer() was been renamed to startServer().');
 }

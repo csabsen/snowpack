@@ -13,7 +13,7 @@ import {
   wrapImportProxy,
 } from '../build/build-import-proxy';
 import {buildFile, runPipelineCleanupStep, runPipelineOptimizeStep} from '../build/build-pipeline';
-import {getMountEntryForFile, getUrlForFileMount} from '../build/file-urls';
+import {getMountEntryForFile, getUrlsForFileMount} from '../build/file-urls';
 import {createImportResolver} from '../build/import-resolver';
 import {runBuiltInOptimize} from '../build/optimize';
 import {EsmHmrEngine} from '../hmr-server-engine';
@@ -266,72 +266,77 @@ export class FileBuilder {
         fileLoc: file.locOnDisk!, // we’re confident these are reading from disk because we just read them
         config: this.config,
       });
-      const resolvedCode = await transformFileImports(file, (spec) => {
-        // Try to resolve the specifier to a known URL in the project
-        let resolvedImportUrl = resolveImportSpecifier(spec);
-        // If not resolved, then this is a package. During build, dependencies are always
-        // installed locally via esinstall, so use localPackageSource here.
-        if (!resolvedImportUrl && importMap.imports[spec]) {
-          const importMapEntry = importMap.imports[spec];
-          resolvedImportUrl = path.posix.join(
-            this.config.buildOptions.metaUrlPath,
-            'pkg',
-            importMapEntry,
-          );
-        }
-        // If still not resolved, then this imported package somehow evaded detection
-        // when we scanned it in the previous step. If you find a bug here, report it!
-        if (!resolvedImportUrl) {
-          isSuccess = false;
-          logger.error(`${file.locOnDisk} - Could not resolve unknown import "${spec}".`);
-          return spec;
-        }
-        // Ignore "http://*" imports
-        if (isRemoteUrl(resolvedImportUrl)) {
-          return resolvedImportUrl;
-        }
-        // Ignore packages marked as external
-        if (this.config.packageOptions.external?.includes(resolvedImportUrl)) {
-          return resolvedImportUrl;
-        }
-        // Handle normal "./" & "../" import specifiers
-        const importExtName = path.extname(resolvedImportUrl);
-        const isBundling = !!this.config.optimize?.bundle;
-        const isProxyImport =
-          importExtName &&
-          importExtName !== '.js' &&
-          !path.posix.isAbsolute(spec) &&
-          // If using our built-in bundler, treat CSS as a first class citizen (no proxy file needed).
-          // TODO: Remove special `.module.css` handling by building css modules to native JS + CSS.
-          (!isBundling || !/(?<!module)\.css$/.test(resolvedImportUrl));
-        const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
-        let resolvedImportPath = removeLeadingSlash(path.normalize(resolvedImportUrl));
-        // We treat ".proxy.js" files special: we need to make sure that they exist on disk
-        // in the final build, so we mark them to be written to disk at the next step.
-        if (isProxyImport) {
-          if (isAbsoluteUrlPath) {
-            this.filesToProxy.push(path.resolve(this.config.buildOptions.out, resolvedImportPath));
-          } else {
-            this.filesToProxy.push(path.resolve(path.dirname(outLoc), resolvedImportPath));
+      const resolvedCode = await transformFileImports(
+        {type: file.baseExt, contents: file.contents},
+        (spec) => {
+          // Try to resolve the specifier to a known URL in the project
+          let resolvedImportUrl = resolveImportSpecifier(spec);
+          // If not resolved, then this is a package. During build, dependencies are always
+          // installed locally via esinstall, so use localPackageSource here.
+          if (!resolvedImportUrl && importMap.imports[spec]) {
+            const importMapEntry = importMap.imports[spec];
+            resolvedImportUrl = path.posix.join(
+              this.config.buildOptions.metaUrlPath,
+              'pkg',
+              importMapEntry,
+            );
+          }
+          // If still not resolved, then this imported package somehow evaded detection
+          // when we scanned it in the previous step. If you find a bug here, report it!
+          if (!resolvedImportUrl) {
+            isSuccess = false;
+            logger.error(`${file.locOnDisk} - Could not resolve unknown import "${spec}".`);
+            return spec;
+          }
+          // Ignore "http://*" imports
+          if (isRemoteUrl(resolvedImportUrl)) {
+            return resolvedImportUrl;
+          }
+          // Ignore packages marked as external
+          if (this.config.packageOptions.external?.includes(resolvedImportUrl)) {
+            return resolvedImportUrl;
+          }
+          // Handle normal "./" & "../" import specifiers
+          const importExtName = path.extname(resolvedImportUrl);
+          const isBundling = !!this.config.optimize?.bundle;
+          const isProxyImport =
+            importExtName &&
+            importExtName !== '.js' &&
+            !path.posix.isAbsolute(spec) &&
+            // If using our built-in bundler, treat CSS as a first class citizen (no proxy file needed).
+            // TODO: Remove special `.module.css` handling by building css modules to native JS + CSS.
+            (!isBundling || !/(?<!module)\.css$/.test(resolvedImportUrl));
+          const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
+          let resolvedImportPath = removeLeadingSlash(path.normalize(resolvedImportUrl));
+          // We treat ".proxy.js" files special: we need to make sure that they exist on disk
+          // in the final build, so we mark them to be written to disk at the next step.
+          if (isProxyImport) {
+            if (isAbsoluteUrlPath) {
+              this.filesToProxy.push(
+                path.resolve(this.config.buildOptions.out, resolvedImportPath),
+              );
+            } else {
+              this.filesToProxy.push(path.resolve(path.dirname(outLoc), resolvedImportPath));
+            }
+
+            resolvedImportPath = resolvedImportPath + '.proxy.js';
+            resolvedImportUrl = resolvedImportUrl + '.proxy.js';
           }
 
-          resolvedImportPath = resolvedImportPath + '.proxy.js';
-          resolvedImportUrl = resolvedImportUrl + '.proxy.js';
-        }
-
-        // When dealing with an absolute import path, we need to honor the baseUrl
-        if (isAbsoluteUrlPath) {
-          resolvedImportUrl = relativeURL(
-            path.dirname(outLoc),
-            path.resolve(this.config.buildOptions.out, resolvedImportPath),
-          );
-        }
-        // Make sure that a relative URL always starts with "./"
-        if (!resolvedImportUrl.startsWith('.') && !resolvedImportUrl.startsWith('/')) {
-          resolvedImportUrl = './' + resolvedImportUrl;
-        }
-        return resolvedImportUrl;
-      });
+          // When dealing with an absolute import path, we need to honor the baseUrl
+          if (isAbsoluteUrlPath) {
+            resolvedImportUrl = relativeURL(
+              path.dirname(outLoc),
+              path.resolve(this.config.buildOptions.out, resolvedImportPath),
+            );
+          }
+          // Make sure that a relative URL always starts with "./"
+          if (!resolvedImportUrl.startsWith('.') && !resolvedImportUrl.startsWith('/')) {
+            resolvedImportUrl = './' + resolvedImportUrl;
+          }
+          return resolvedImportUrl;
+        },
+      );
       this.output[outLoc] = resolvedCode;
     }
     return isSuccess;
@@ -488,7 +493,7 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
     });
     for (const rawLocOnDisk of allFiles) {
       const fileLoc = path.resolve(rawLocOnDisk); // this is necessary since glob.sync() returns paths with / on windows.  path.resolve() will switch them to the native path separator.
-      const finalUrl = getUrlForFileMount({fileLoc, mountKey: mountedDir, mountEntry, config})!;
+      const finalUrl = getUrlsForFileMount({fileLoc, mountKey: mountedDir, mountEntry, config})![0];
       const finalDestLoc = path.join(buildDirectoryLoc, finalUrl);
 
       const existedFileLoc = finalDestLocMap.get(finalDestLoc);
@@ -635,7 +640,7 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
     }
     onFileChangeCallback({filePath: fileLoc});
     const [mountKey, mountEntry] = mountEntryResult;
-    const finalUrl = getUrlForFileMount({fileLoc, mountKey, mountEntry, config})!;
+    const finalUrl = getUrlsForFileMount({fileLoc, mountKey, mountEntry, config})![0];
     const finalDest = path.join(buildDirectoryLoc, finalUrl);
     const outDir = path.dirname(finalDest);
     const changedPipelineFile = new FileBuilder({

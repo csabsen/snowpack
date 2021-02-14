@@ -50,8 +50,8 @@ import {
   wrapImportMeta,
   wrapImportProxy,
 } from '../build/build-import-proxy';
-import {buildFile as _buildFile, getInputsFromOutput} from '../build/build-pipeline';
-import {getUrlForFile, getMountEntryForFile} from '../build/file-urls';
+import {buildFile, getInputsFromOutput} from '../build/build-pipeline';
+import {getUrlsForFile, getMountEntryForFile} from '../build/file-urls';
 import {createImportResolver} from '../build/import-resolver';
 import {EsmHmrEngine} from '../hmr-server-engine';
 import {logger} from '../logger';
@@ -67,6 +67,8 @@ import {
   MountEntry,
   OnFileChangeCallback,
   RouteConfigObject,
+  SnowpackConfig,
+  SnowpackSourceFile,
   SnowpackBuildMap,
   SnowpackDevServer,
   ServerRuntime,
@@ -94,17 +96,24 @@ import mkdirp from 'mkdirp';
 import rimraf from 'rimraf';
 import {glob} from 'glob';
 
-class BiMap {
-  private keyToValue = new Map();
-  private valueToKey = new Map();
-  add(key: string, value: string) {
+class OneToManyMap {
+  private keyToValue = new Map<string, string[]>();
+  private valueToKey = new Map<string, string>();
+  add(key: string, _value: string | string[]) {
+    const value = Array.isArray(_value) ? _value : [_value];
     this.keyToValue.set(key, value);
-    this.valueToKey.set(value, key);
+    for (const val of value) {
+      this.valueToKey.set(val, key);
+    }
   }
   delete(key: string) {
     const value = this.value(key);
     this.keyToValue.delete(key);
-    this.keyToValue.delete(value);
+    if (value) {
+      for (const val of value) {
+        this.keyToValue.delete(val);
+      }
+    }
   }
   key(value: string) {
     return this.valueToKey.get(value);
@@ -338,16 +347,16 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     });
   }
 
-  const inMemoryBuildCache = new Map<string, SnowpackBuildMap>();
+  const inMemoryBuildCache = new Map<string, FileBuilder>();
   const filesBeingDeleted = new Set<string>();
-  const filesBeingBuilt = new Map<string, Promise<SnowpackBuildMap>>();
-  let mountedFiles = new BiMap();
+  // const filesBeingBuilt = new Map<string, Promise<SnowpackBuildMap>>();
+  let mountedFiles = new OneToManyMap();
 
   for (const [mountKey, mountEntry] of Object.entries(config.mount)) {
     logger.debug(`Mounting directory: '${mountKey}' as URL '${mountEntry.url}'`);
     const files = glob.sync(path.join(mountKey, '**'), {nodir: true});
     for (const f of files) {
-      mountedFiles.add(f, getUrlForFile(f, config)!);
+      mountedFiles.add(f, getUrlsForFile(f, config)!);
     }
   }
 
@@ -417,6 +426,247 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
   }
 
+  class FileBuilder {
+    output: SnowpackBuildMap = {};
+    filesToResolve: Record<string, SnowpackSourceFile> = {};
+    filesToProxy: string[] = [];
+    isHMR: boolean;
+    isSSR: boolean;
+    isStatic: boolean;
+    isResolve: boolean;
+    buildPromise: Promise<SnowpackBuildMap> | undefined;
+
+    readonly loc: string;
+    // readonly mountEntry: MountEntry;
+    // readonly outDir: string;
+    readonly config: SnowpackConfig;
+
+    constructor({
+      loc,
+      isHMR,
+      isSSR,
+      isStatic,
+      isResolve,
+      // mountEntry,
+      // outDir,
+      config,
+    }: {
+      loc: string;
+      isHMR: boolean;
+      isSSR: boolean;
+      isStatic: boolean;
+      isResolve: boolean;
+      // mountEntry: MountEntry;
+      // outDir: string;
+      config: SnowpackConfig;
+    }) {
+      this.loc = loc;
+      this.isHMR = isHMR;
+      this.isSSR = isSSR;
+      this.isStatic = isStatic;
+      this.isResolve = isResolve;
+      // this.mountEntry = mountEntry;
+      // this.outDir = outDir;
+      this.config = config;
+    }
+
+    private verifyRequestFromBuild(type: string): SnowpackBuiltFile {
+      // Verify that the requested file exists in the build output map.
+      if (!this.output[type] || !Object.keys(this.output)) {
+        throw new Error(`Requested content "${type}" but built ${Object.keys(this.output)}`);
+      }
+      return this.output[type];
+    }
+
+    /**
+     * Resolve Imports: Resolved imports are based on the state of the file
+     * system, so they can't be cached long-term with the build.
+     */
+    private async resolveImports({
+      contents: _contents,
+      type,
+      url,
+      reqUrlHmrParam,
+    }: {
+      contents: string | Buffer;
+      type: string;
+      url: string;
+      reqUrlHmrParam: string | false;
+    }): Promise<string | Buffer> {
+      if (typeof _contents !== 'string') {
+        return _contents;
+      }
+      let contents = _contents;
+      const resolveImportSpecifier = createImportResolver({
+        fileLoc: this.loc,
+        config,
+      });
+      contents = await transformFileImports({type, contents}, (spec) => {
+        // Try to resolve the specifier to a known URL in the project
+        let resolvedImportUrl = resolveImportSpecifier(spec);
+        // Handle a package import
+        if (!resolvedImportUrl) {
+          resolvedImportUrl = pkgSource.resolvePackageImport(this.loc, spec, config);
+        }
+        // Handle a package import that couldn't be resolved
+        if (!resolvedImportUrl) {
+          return spec;
+        }
+        // Ignore "http://*" imports
+        if (isRemoteUrl(resolvedImportUrl)) {
+          return resolvedImportUrl;
+        }
+        // Ignore packages marked as external
+        if (config.packageOptions.external?.includes(resolvedImportUrl)) {
+          return spec;
+        }
+        // Handle normal "./" & "../" import specifiers
+        const importExtName = path.posix.extname(resolvedImportUrl);
+        const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs';
+        const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
+        if (isProxyImport) {
+          resolvedImportUrl = resolvedImportUrl + '.proxy.js';
+        }
+
+        // When dealing with an absolute import path, we need to honor the baseUrl
+        // proxy modules may attach code to the root HTML (like style) so don't resolve
+        if (isAbsoluteUrlPath /* && !isProxyModule */) {
+          resolvedImportUrl = relativeURL(path.posix.dirname(url), resolvedImportUrl);
+        }
+        // Make sure that a relative URL always starts with "./"
+        if (!resolvedImportUrl.startsWith('.') && !resolvedImportUrl.startsWith('/')) {
+          resolvedImportUrl = './' + resolvedImportUrl;
+        }
+        return resolvedImportUrl;
+      });
+
+      if (type === '.js' && reqUrlHmrParam)
+        contents = await transformEsmImports(contents as string, (imp) => {
+          const importUrl = path.posix.resolve(path.posix.dirname(url), imp);
+          const node = hmrEngine.getEntry(importUrl);
+          if (node && node.needsReplacement) {
+            hmrEngine.markEntryForReplacement(node, false);
+            return `${imp}?${reqUrlHmrParam}`;
+          }
+          return imp;
+        });
+
+      if (type === '.js') {
+        const isHmrEnabled = contents.includes('import.meta.hot');
+        const rawImports = await scanCodeImportsExports(contents);
+        const resolvedImports = rawImports.map((imp) => {
+          let spec = contents.substring(imp.s, imp.e);
+          if (imp.d > -1) {
+            spec = matchDynamicImportValue(spec) || '';
+          }
+          spec = spec.replace(/\?mtime=[0-9]+$/, '');
+          return path.posix.resolve(path.posix.dirname(url), spec);
+        });
+        hmrEngine.setEntry(url, resolvedImports, isHmrEnabled);
+      }
+
+      return contents;
+    }
+
+    /**
+     * Given a file, build it. Building a file sends it through our internal
+     * file builder pipeline, and outputs a build map representing the final
+     * build. A Build Map is used because one source file can result in multiple
+     * built files (Example: .svelte -> .js & .css).
+     */
+    async build() {
+      if (this.buildPromise) {
+        return this.buildPromise;
+      }
+      const fileBuilderPromise = (async () => {
+        const builtFileOutput = await buildFile(url.pathToFileURL(this.loc), {
+          config: this.config,
+          isDev: true,
+          isSSR: this.isSSR,
+          isHmrEnabled: this.isHMR,
+        });
+        return builtFileOutput;
+      })();
+      this.buildPromise = fileBuilderPromise;
+      try {
+        messageBus.emit(paintEvent.BUILD_FILE, {id: this.loc, isBuilding: true});
+        this.output = await fileBuilderPromise;
+      } finally {
+        this.buildPromise = undefined;
+        messageBus.emit(paintEvent.BUILD_FILE, {id: this.loc, isBuilding: false});
+      }
+    }
+
+    async getResult(
+      url: string,
+      type: string,
+      reqUrlHmrParam: string | false,
+    ): Promise<string | Buffer> {
+      const {code, map} = this.verifyRequestFromBuild(type);
+      let finalResponse = code;
+      // Handle attached CSS.
+      if (type === '.js' && this.output['.css']) {
+        finalResponse = `import '${replaceExtension(url, '.js', '.css')}';\n` + finalResponse;
+      }
+      // Resolve imports.
+      if (this.loc && (type === '.js' || type === '.html' || type === '.css')) {
+        finalResponse = await this.resolveImports({
+          url,
+          type,
+          contents: finalResponse,
+          reqUrlHmrParam,
+        });
+      }
+      // Wrap the response.
+      switch (type) {
+        case '.html': {
+          finalResponse = wrapHtmlResponse({
+            code: finalResponse as string,
+            hmr: this.isHMR,
+            hmrPort: hmrEngine.port !== port ? hmrEngine.port : undefined,
+            isDev: true,
+            config,
+            mode: 'development',
+          });
+          break;
+        }
+        case '.css': {
+          // if (sourceMap) code = cssSourceMappingURL(code as string, sourceMappingURL);
+          break;
+        }
+        case '.js':
+          {
+            // if (isProxyModule) {
+            //   code = await wrapImportProxy({url: reqPath, code, hmr: isHMR, config});
+            // } else {
+            finalResponse = wrapImportMeta({
+              code: finalResponse as string,
+              env: true,
+              hmr: this.isHMR,
+              config,
+            });
+          }
+
+          // source mapping
+          // if (sourceMap) code = jsSourceMappingURL(code, sourceMappingURL);
+
+          break;
+      }
+
+      // Return the finalized response.
+      return finalResponse;
+    }
+
+    getSourceMap(type: string): string | undefined {
+      return this.output[type].map;
+    }
+    async getProxy(url: string, type: string) {
+      const code = this.output[type].code;
+      // TODO: support css modules
+      return await wrapImportProxy({url, code, hmr: this.isHMR, config});
+    }
+  }
+
   function loadUrl(
     reqUrl: string,
     {
@@ -461,7 +711,9 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     const allowStale = _allowStale ?? false;
     const encoding = _encoding ?? null;
     const reqUrlHmrParam = reqUrl.includes('?mtime=') && reqUrl.split('?')[1];
-    let reqPath = decodeURI(url.parse(reqUrl).pathname!);
+    const reqPath = decodeURI(url.parse(reqUrl).pathname!);
+    const resourcePath = reqUrl.replace(/\.map$/, '').replace(/\.proxy\.js$/, '');
+    const resourceType = path.extname(resourcePath) || '.html';
 
     if (reqPath === getMetaUrlPath('/hmr-client.js', config)) {
       return {
@@ -484,78 +736,33 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         contentType: 'application/javascript',
       };
     }
-
-    async function getFileFromDependency(reqPath: string): Promise<FoundFile | null> {
+    if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
       const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
       const loadedModule = await pkgSource.load(webModuleUrl, commandOptions);
       return {
-        loc: undefined,
-        // TODO: the load function should tell us this?
-        type: path.extname(reqPath) || '.js',
-        contents: typeof loadedModule === 'string' ? Buffer.from(loadedModule) : loadedModule,
-        // "isStatic: true" because it's already been built as a part of loading/bundling
-        isStatic: true,
-        isResolve: true,
+        contents: encodeResponse(loadedModule, encoding),
+        originalFileLoc: null,
+        contentType: mime.lookup(reqPath) || 'application/javascript',
       };
     }
-    
-    class FileBuilder {
 
-      constructor() {}
-
-      build() {}
-      resolve() {}
-      finalize() {}
-
-      getResult() {}
-      getSourceMap() {}
-      getProxy() {}
-      
-    }
-    
-    // TODO:
-    // const foundFile = new FileBuilder({...})
-    // // get foundFile from the cache, or build it
-    // // given foundFileObject, get its proxy, source map, or source
-    // // resolve those imports
-    // // do any final wrapping
-    // // return it
-
-    console.log('reqPath', reqPath);
-    let foundFile: FoundFile | null = null;
-    if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
-      foundFile = await getFileFromDependency(reqPath);
-    } else {
-      const fileLoc =
-        mountedFiles.key(reqUrl) ||
-        mountedFiles.key(reqUrl + '.html') ||
-        mountedFiles.key(reqUrl + 'index.html') ||
-        mountedFiles.key(reqUrl + '/index.html');
-      if (fileLoc) {
-        const [, mountEntry] = getMountEntryForFile(fileLoc, config)!;
-        foundFile = {
-          loc: fileLoc,
-          type: path.extname(reqPath) || '.html',
-          contents: await fs.readFile(fileLoc),
-          isStatic: mountEntry.static,
-          isResolve: mountEntry.resolve,
-        };
-      }
-    }
-
-    if (!foundFile) {
+    const attemptedFileLoc =
+      mountedFiles.key(resourcePath) ||
+      mountedFiles.key(resourcePath + '.html') ||
+      mountedFiles.key(resourcePath + 'index.html') ||
+      mountedFiles.key(resourcePath + '/index.html');
+    if (!attemptedFileLoc) {
       throw new NotFoundError([reqPath]);
     }
 
-    function verifyRequestFromBuild(output: SnowpackBuildMap, type: string): SnowpackBuiltFile {
-      // Verify that the requested file exists in the build output map.
-      if (!output[type] || !Object.keys(output)) {
-        throw new Error(
-          `${reqPath}: Requested content "${responseType}" but built ${Object.keys(output)}`,
-        );
-      }
-      return output[type];
-    }
+    const [, mountEntry] = getMountEntryForFile(attemptedFileLoc, config)!;
+    const foundFile = {
+      loc: attemptedFileLoc,
+      type: path.extname(reqPath) || '.html',
+      contents: await fs.readFile(attemptedFileLoc),
+      isStatic: mountEntry.static,
+      isResolve: mountEntry.resolve,
+    };
 
     function handleFinalizeError(err: Error) {
       logger.error(FILE_BUILD_RESULT_ERROR);
@@ -566,70 +773,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         fileLoc,
         errorStackTrace: err.stack,
       });
-    }
-    /**
-     * Given a build, finalize it for the response. This involves running
-     * individual steps needed to go from build result to sever response,
-     * including:
-     *   - wrapResponse(): Wrap responses
-     *   - resolveResponseImports(): Resolve all ESM imports
-     */
-    async function finalizeResponse(
-      fileLoc: string | undefined,
-      requestedContentType: string,
-      output: SnowpackBuildMap,
-    ): Promise<string | Buffer> {
-      const {code, map} = verifyRequestFromBuild(output, requestedContentType);
-      let finalResponse = code;
-      // Handle attached CSS.
-      if (requestedContentType === '.js' && output['.css']) {
-        finalResponse = `import '${replaceExtension(reqPath, '.js', '.css')}';\n` + finalResponse;
-      }
-      // Resolve imports.
-      if (
-        fileLoc &&
-        (requestedContentType === '.js' ||
-          requestedContentType === '.html' ||
-          requestedContentType === '.css')
-      ) {
-        finalResponse = await resolveResponseImports(
-          fileLoc,
-          requestedContentType,
-          finalResponse as string,
-        );
-      }
-      // Wrap the response.
-      switch (requestedContentType) {
-        case '.html': {
-        finalResponse = wrapHtmlResponse({
-          code: finalResponse as string,
-          hmr: isHMR,
-          hmrPort: hmrEngine.port !== port ? hmrEngine.port : undefined,
-          isDev: true,
-          config,
-          mode: 'development',
-        });
-        break;
-        }
-        case '.css': {
-          // if (sourceMap) code = cssSourceMappingURL(code as string, sourceMappingURL);
-          break;
-        }
-        case '.js': {
-          // if (isProxyModule) {
-          //   code = await wrapImportProxy({url: reqPath, code, hmr: isHMR, config});
-          // } else {
-            finalResponse = wrapImportMeta({code: finalResponse as string, env: true, hmr: isHMR, config});
-          }
-
-          // source mapping
-          // if (sourceMap) code = jsSourceMappingURL(code, sourceMappingURL);
-
-          break;
-      }
-
-      // Return the finalized response.
-      return finalResponse;
     }
 
     const {
@@ -643,287 +786,34 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     // TODO: Once plugins are able to add virtual files + imports, this will no longer be needed.
     const isStatic = _isStatic && responseType !== '.html';
 
-    if (isStatic || !fileLoc) {
-      // If no resolution needed, just send the file directly.
-      if (!isResolve) {
-        return {
-          contents: encodeResponse(responseContents, encoding),
-          contentType: mime.lookup(responseType),
-          originalFileLoc: null,
-        };
-      }
-
-      // Otherwise, finalize the response (where resolution happens) before sending.
-      let finalizedResponse = await finalizeResponse(fileLoc, responseType, {
-        [responseType]: {code: responseContents},
-      }).catch((err) => {
-        handleFinalizeError(err);
-        throw err;
-      });
-
-      return {
-        contents: encodeResponse(finalizedResponse, encoding),
-        contentType: mime.lookup(responseType),
-        originalFileLoc: null,
-      };
-    }
-
     // 1. Check the hot build cache. If it's already found, then just serve it.
-    let hotCachedResponse: SnowpackBuildMap | undefined = inMemoryBuildCache.get(
-      getCacheKey(fileLoc, {isSSR, env: process.env.NODE_ENV}),
-    );
-    if (hotCachedResponse) {
-      const finalizedResponse = await finalizeResponse(
-        fileLoc,
-        responseType,
-        hotCachedResponse,
-      ).catch((err) => {
-        handleFinalizeError(err);
-        throw err;
-      });
-      return {
-        contents: encodeResponse(finalizedResponse, encoding),
-        originalFileLoc: null,
-        contentType: mime.lookup(responseType),
-      };
+    const cacheKey = getCacheKey(fileLoc, {isSSR, env: process.env.NODE_ENV});
+    let fileBuilder: FileBuilder | undefined = inMemoryBuildCache.get(cacheKey);
+
+    if (!fileBuilder) {
+      fileBuilder = new FileBuilder({loc: fileLoc, isSSR, isHMR, config, isStatic, isResolve});
+      inMemoryBuildCache.set(cacheKey, fileBuilder);
+      await fileBuilder.build();
     }
 
-    // 2. Check the persistent cache. If found, serve it via a
-    // "trust-but-verify" strategy. Build it after sending, and if it no longer
-    // matches then assume the entire cache is suspect. In that case, clear the
-    // persistent cache and then force a live-reload of the page.
-    const cachedBuildData =
-      allowStale &&
-      process.env.NODE_ENV !== 'test' &&
-      !filesBeingDeleted.has(fileLoc) &&
-      !(await isBinaryFile(fileLoc)) &&
-      (await cacache
-        .get(BUILD_CACHE, getCacheKey(fileLoc, {isSSR, env: process.env.NODE_ENV}))
-        .catch(() => null));
-    if (cachedBuildData) {
-      const {originalFileHash} = cachedBuildData.metadata;
-      const newFileHash = etag(responseContents);
-      if (originalFileHash === newFileHash) {
-        // IF THIS FAILS TS CHECK: If you are changing the structure of
-        // SnowpackBuildMap, be sure to also update `BUILD_CACHE` in util.ts to
-        // a new unique name, to guarantee a clean cache for our users.
-        const coldCachedResponse: SnowpackBuildMap = JSON.parse(
-          cachedBuildData.data.toString(),
-        ) as Record<
-          string,
-          {
-            code: string;
-            map?: string;
-          }
-        >;
-        inMemoryBuildCache.set(
-          getCacheKey(fileLoc, {isSSR, env: process.env.NODE_ENV}),
-          coldCachedResponse,
-        );
-        const finalizedResponse = await finalizeResponse(
-          fileLoc,
-          responseType,
-          coldCachedResponse,
-        ).catch((err) => {
-          handleFinalizeError(err);
-          throw err;
-        });
-        // Trust...
-        return {
-          contents: encodeResponse(finalizedResponse, encoding),
-          originalFileLoc: fileLoc,
-          contentType: mime.lookup(responseType),
-          // ...but verify.
-          checkStale: async () => {
-            let checkFinalBuildResult: SnowpackBuildMap | null = null;
-            try {
-              checkFinalBuildResult = await buildFile(fileLoc!);
-            } catch (err) {
-              // safe to ignore, it will be surfaced later anyway
-            } finally {
-              if (
-                !checkFinalBuildResult ||
-                !cachedBuildData.data.equals(Buffer.from(JSON.stringify(checkFinalBuildResult)))
-              ) {
-                inMemoryBuildCache.clear();
-                await cacache.rm.all(BUILD_CACHE);
-                hmrEngine.broadcastMessage({type: 'reload'});
-              }
-            }
-            return;
-          },
-        };
+    let finalizedResponse: string | Buffer;
+    if (reqUrl.endsWith('.proxy.js')) {
+      finalizedResponse = await fileBuilder.getProxy(resourcePath, resourceType);
+    } else if (reqUrl.endsWith('.proxy.js')) {
+      const _finalizedResponse = await fileBuilder.getSourceMap(resourcePath);
+      if (!_finalizedResponse) {
+        throw new NotFoundError([reqPath]);
       }
+      finalizedResponse = _finalizedResponse;
+    } else {
+      finalizedResponse = await fileBuilder.getResult(reqPath, resourceType, reqUrlHmrParam);
     }
-
-    // 5. Final option: build the file, serve it, and cache it.
-    let responseOutput: SnowpackBuildMap;
-
-    try {
-      responseOutput = await buildFile(fileLoc);
-    } catch (err) {
-      hmrEngine.broadcastMessage({
-        type: 'error',
-        title:
-          `Build Error` +
-          (err.__snowpackBuildDetails ? `: ${err.__snowpackBuildDetails.name}` : ''),
-        errorMessage: err.toString(),
-        fileLoc,
-        errorStackTrace: err.stack,
-      });
-      throw err;
-    }
-    const finalizedResponse = await finalizeResponse(fileLoc, responseType, responseOutput).catch(
-      (err) => {
-        handleFinalizeError(err);
-        throw err;
-      },
-    );
-
-    // Save the file to the cold cache for reuse across restarts.
-    cacache
-      .put(
-        BUILD_CACHE,
-        getCacheKey(fileLoc, {isSSR, env: process.env.NODE_ENV}),
-        Buffer.from(JSON.stringify(responseOutput)),
-        {
-          metadata: {originalFileHash: etag(responseContents)},
-        },
-      )
-      .catch((err) => {
-        logger.error(`Cache Error: ${err.toString()}`);
-      });
 
     return {
       contents: encodeResponse(finalizedResponse, encoding),
       originalFileLoc: fileLoc,
       contentType: mime.lookup(responseType),
     };
-      /**
-       * Given a file, build it. Building a file sends it through our internal
-       * file builder pipeline, and outputs a build map representing the final
-       * build. A Build Map is used because one source file can result in multiple
-       * built files (Example: .svelte -> .js & .css).
-       */
-      async function buildFile(fileLoc: string): Promise<SnowpackBuildMap> {
-        const existingBuilderPromise = filesBeingBuilt.get(fileLoc);
-        if (existingBuilderPromise) {
-          return existingBuilderPromise;
-        }
-        const fileBuilderPromise = (async () => {
-          const builtFileOutput = await _buildFile(url.pathToFileURL(fileLoc), {
-            config,
-            isDev: true,
-            isSSR,
-            isHmrEnabled: isHMR,
-          });
-          inMemoryBuildCache.set(
-            getCacheKey(fileLoc, {isSSR, env: process.env.NODE_ENV}),
-            builtFileOutput,
-          );
-          return builtFileOutput;
-        })();
-        filesBeingBuilt.set(fileLoc, fileBuilderPromise);
-        try {
-          messageBus.emit(paintEvent.BUILD_FILE, {id: fileLoc, isBuilding: true});
-          return await fileBuilderPromise;
-        } finally {
-          filesBeingBuilt.delete(fileLoc);
-          messageBus.emit(paintEvent.BUILD_FILE, {id: fileLoc, isBuilding: false});
-        }
-      }
-
-
-    /**
-     * Resolve Imports: Resolved imports are based on the state of the file
-     * system, so they can't be cached long-term with the build.
-     */
-    async function resolveResponseImports(
-      fileLoc: string,
-      requestedContentType: string,
-      wrappedResponse: string,
-    ): Promise<string> {
-      const resolveImportSpecifier = createImportResolver({
-        fileLoc,
-        config,
-      });
-      wrappedResponse = await transformFileImports(
-        {
-          locOnDisk: fileLoc,
-          contents: wrappedResponse,
-          root: config.root,
-          baseExt: requestedContentType,
-        },
-        (spec) => {
-          // Try to resolve the specifier to a known URL in the project
-          let resolvedImportUrl = resolveImportSpecifier(spec);
-          // Handle a package import
-          if (!resolvedImportUrl) {
-            resolvedImportUrl = pkgSource.resolvePackageImport(fileLoc, spec, config);
-          }
-          // Handle a package import that couldn't be resolved
-          if (!resolvedImportUrl) {
-            return spec;
-          }
-          // Ignore "http://*" imports
-          if (isRemoteUrl(resolvedImportUrl)) {
-            return resolvedImportUrl;
-          }
-          // Ignore packages marked as external
-          if (config.packageOptions.external?.includes(resolvedImportUrl)) {
-            return spec;
-          }
-          // Handle normal "./" & "../" import specifiers
-          const importExtName = path.posix.extname(resolvedImportUrl);
-          const isProxyImport =
-            importExtName && importExtName !== '.js' && importExtName !== '.mjs';
-          const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
-          if (isProxyImport) {
-            resolvedImportUrl = resolvedImportUrl + '.proxy.js';
-          }
-
-          // When dealing with an absolute import path, we need to honor the baseUrl
-          // proxy modules may attach code to the root HTML (like style) so don't resolve
-          if (isAbsoluteUrlPath /* && !isProxyModule */) {
-            resolvedImportUrl = relativeURL(path.posix.dirname(reqPath), resolvedImportUrl);
-          }
-          // Make sure that a relative URL always starts with "./"
-          if (!resolvedImportUrl.startsWith('.') && !resolvedImportUrl.startsWith('/')) {
-            resolvedImportUrl = './' + resolvedImportUrl;
-          }
-          return resolvedImportUrl;
-        },
-      );
-
-      let code = wrappedResponse;
-      if (requestedContentType === '.js' && reqUrlHmrParam)
-        code = await transformEsmImports(code as string, (imp) => {
-          const importUrl = path.posix.resolve(path.posix.dirname(reqPath), imp);
-          const node = hmrEngine.getEntry(importUrl);
-          if (node && node.needsReplacement) {
-            hmrEngine.markEntryForReplacement(node, false);
-            return `${imp}?${reqUrlHmrParam}`;
-          }
-          return imp;
-        });
-
-      if (requestedContentType === '.js') {
-        const isHmrEnabled = code.includes('import.meta.hot');
-        const rawImports = await scanCodeImportsExports(code);
-        const resolvedImports = rawImports.map((imp) => {
-          let spec = code.substring(imp.s, imp.e);
-          if (imp.d > -1) {
-            spec = matchDynamicImportValue(spec) || '';
-          }
-          spec = spec.replace(/\?mtime=[0-9]+$/, '');
-          return path.posix.resolve(path.posix.dirname(reqPath), spec);
-        });
-        hmrEngine.setEntry(reqPath, resolvedImports, isHmrEnabled);
-      }
-
-      wrappedResponse = code;
-      return wrappedResponse;
-    }
   }
 
   /**
@@ -1144,27 +1034,17 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
   async function onWatchEvent(fileLoc: string) {
     logger.info(colors.cyan('File changed...'));
     onFileChangeCallback({filePath: fileLoc});
-    const updatedUrl = getUrlForFile(fileLoc, config);
-    if (updatedUrl) {
-      handleHmrUpdate(fileLoc, updatedUrl);
-      knownETags.delete(updatedUrl);
-      knownETags.delete(updatedUrl + '.proxy.js');
+    const updatedUrls = getUrlsForFile(fileLoc, config);
+    if (updatedUrls) {
+      handleHmrUpdate(fileLoc, updatedUrls[0]);
+      knownETags.delete(updatedUrls[0]);
+      knownETags.delete(updatedUrls[0] + '.proxy.js');
     }
     inMemoryBuildCache.delete(getCacheKey(fileLoc, {isSSR: true, env: process.env.NODE_ENV}));
     inMemoryBuildCache.delete(getCacheKey(fileLoc, {isSSR: false, env: process.env.NODE_ENV}));
-    filesBeingDeleted.add(fileLoc);
-    await cacache.rm.entry(
-      BUILD_CACHE,
-      getCacheKey(fileLoc, {isSSR: true, env: process.env.NODE_ENV}),
-    );
-    await cacache.rm.entry(
-      BUILD_CACHE,
-      getCacheKey(fileLoc, {isSSR: false, env: process.env.NODE_ENV}),
-    );
     for (const plugin of config.plugins) {
       plugin.onChange && plugin.onChange({filePath: fileLoc});
     }
-    filesBeingDeleted.delete(fileLoc);
   }
 
   const watcher = chokidar.watch(Object.keys(config.mount), {
@@ -1175,7 +1055,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
   watcher.on('add', (fileLoc) => {
     knownETags.clear();
     onWatchEvent(fileLoc);
-    mountedFiles.add(fileLoc, getUrlForFile(fileLoc, config)!);
+    mountedFiles.add(fileLoc, getUrlsForFile(fileLoc, config)!);
   });
   watcher.on('unlink', (fileLoc) => {
     knownETags.clear();
@@ -1194,7 +1074,10 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     handleRequest,
     sendResponseFile,
     sendResponseError,
-    getUrlForFile: (fileLoc: string) => getUrlForFile(fileLoc, config),
+    getUrlForFile: (fileLoc: string) => {
+      const result = getUrlsForFile(fileLoc, config);
+      return result ? result[0] : result;
+    },
     onFileChange: (callback) => (onFileChangeCallback = callback),
     getServerRuntime: (options) => getServerRuntime(sp, options),
     async shutdown() {

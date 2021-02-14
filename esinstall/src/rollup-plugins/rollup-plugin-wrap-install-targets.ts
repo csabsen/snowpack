@@ -119,7 +119,6 @@ export function rollupPluginWrapInstallTargets(
     buildStart(inputOptions) {
       const input = inputOptions.input as {[entryAlias: string]: string};
       for (const [key, val] of Object.entries(input)) {
-        console.log(key, val);
         if (isRemoteUrl(val)) {
           continue;
         }

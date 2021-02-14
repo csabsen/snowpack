@@ -36,6 +36,12 @@ export function sanitizePackageName(filepath: string): string {
   return [...dirs.map((path) => path.replace(/\.js$/i, 'js')), file].join('/');
 }
 
+function getRootNodeModulesDirectory(loc: string) {
+  const parts = loc.split('node_modules');
+  parts.pop()!;
+  const packageRoot = path.join(parts.join('node_modules'), 'node_modules');
+  return packageRoot;
+}
 function getRootPackageDirectory(loc: string) {
   const parts = loc.split('node_modules');
   const packageParts = parts.pop()!.split('/').filter(Boolean);
@@ -61,26 +67,36 @@ const inProgress = new PQueue({concurrency: 1});
  * interacts with esinstall and your locally installed dependencies.
  */
 export default {
-  async load(id: string): Promise<Buffer | string> {
+  async load(id: string, loadOptions): Promise<Buffer | string> {
+    const PACKAGE_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'pkg/');
     const idParts = id.split('/');
     let hash = idParts.shift()!;
     const isLookup = idParts[0] !== '-';
     if (!isLookup) {
       idParts.shift();
     }
-    console.log(allHashes, hash);
     const isRaw = hash.startsWith('raw:');
     if (isRaw) {
       hash = hash.replace('raw:', 'local:');
     }
-    const rootPackageDirectory = allHashes[hash];
+
+    const spec = idParts.join('/');
+    let packageName = idParts.shift()!;
+    if (packageName.startsWith('@')) {
+      packageName += '/' + idParts.shift()!;
+    }
+    if (packageName.endsWith('.js') && !isLookup) {
+      packageName = packageName.replace(/\.js$/, '');
+    }
+    const internalSpec = idParts.join('/');
+    console.log('A', spec, internalSpec);
+    const rootNodeModulesDirectory = allHashes[hash];
+    const rootPackageDirectory = path.join(rootNodeModulesDirectory, packageName);
     const entrypointPackageManifestLoc = path.join(rootPackageDirectory, 'package.json');
     const entrypointPackageManifestStr = await fs.readFile(entrypointPackageManifestLoc, 'utf8');
     const entrypointPackageManifest = JSON.parse(entrypointPackageManifestStr);
-    const packageName = entrypointPackageManifest.name;
+    // const packageName = entrypointPackageManifest.name;
 
-    const spec = idParts.join('/');
-    const internalSpec = spec.replace(packageName + '/', '');
 
     if (isRaw) {
       let installedPackageCode = await fs.readFile(
@@ -97,7 +113,7 @@ export default {
 
     if (
       etag(entrypointPackageManifestStr) !==
-      (await fs.readFile(path.join(installDest, '.hash'), 'utf-8').catch((err) => null))
+      (await fs.readFile(path.join(installDest, '.meta'), 'utf-8').catch((err) => null))
     ) {
       existsAndIsValid = false;
     }
@@ -106,6 +122,7 @@ export default {
       await inProgress.onIdle();
       const dependencyFileLoc = path.join(installDest, spec);
       let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
+      const allResolvedImports = new Set<string>();
       installedPackageCode = await transformAddMissingDefaultExport(installedPackageCode);
       installedPackageCode = await transformFileImports(
         {type: path.extname(dependencyFileLoc), contents: installedPackageCode},
@@ -116,19 +133,32 @@ export default {
           if (spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/')) {
             return spec;
           }
-          return this.resolvePackageImport(entrypointPackageManifestLoc, spec, config) || spec;
+          const resolvedSpecUrl = this.resolvePackageImport(
+            entrypointPackageManifestLoc,
+            spec,
+            config,
+          );
+          if (!resolvedSpecUrl) {
+            return spec;
+          }
+          allResolvedImports.add(resolvedSpecUrl.substr(PACKAGE_PATH_PREFIX.length));
+          return resolvedSpecUrl;
         },
+      );
+      await Promise.all(
+        [...allResolvedImports].map((resolvedSpec) => this.load(resolvedSpec, loadOptions)),
       );
       return installedPackageCode;
     }
 
-    return inProgress.add(async () => {
+    let finalLocation: string | undefined;
+    const loadResponse = await inProgress.add(async () => {
       const importMap =
         existsSync(installDest) &&
         JSON.parse((await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!);
 
       if (importMap && importMap.imports[spec]) {
-        const finalLocation = path.posix.join(
+        finalLocation = path.posix.join(
           config.buildOptions.metaUrlPath,
           'pkg',
           hash,
@@ -148,8 +178,7 @@ export default {
             .filter((t) => t === packageName || t.startsWith(packageName + '/')),
         ]),
       );
-      console.log('START', installEntrypoints);
-      console.time(spec);
+      console.log(`Installing ${spec}...`);
       // TODO: external should be a function in esinstall
       const external = [
         ...Object.keys(entrypointPackageManifest.dependencies || {}),
@@ -205,13 +234,13 @@ export default {
         },
       });
       await fs.writeFile(
-        path.join(installDest, '.hash'),
+        path.join(installDest, '.meta'),
         etag(entrypointPackageManifestStr),
         'utf8',
       );
-      console.timeEnd(spec);
+      console.log(`Installing ${spec}... DONE`);
 
-      const finalLocation = path.posix.join(
+      finalLocation = path.posix.join(
         config.buildOptions.metaUrlPath,
         'pkg',
         hash,
@@ -220,6 +249,10 @@ export default {
       );
       return `export * from "${finalLocation}"; export {default} from "${finalLocation}";`;
     });
+    if (finalLocation) {
+      await this.load(finalLocation.substr(PACKAGE_PATH_PREFIX.length), loadOptions);
+    }
+    return loadResponse;
   },
 
   modifyBuildInstallOptions({installOptions, config}) {
@@ -237,7 +270,55 @@ export default {
 
   async prepare(commandOptions: CommandOptions) {
     config = commandOptions.config;
-    installTargets = await getInstallTargets(config, []);
+
+    const installDirectoryHashLoc = path.join(DEV_DEPENDENCIES_DIR, '.meta');
+    const installDirectoryHash = await fs
+      .readFile(installDirectoryHashLoc, 'utf-8')
+      .catch(() => null);
+    if (installDirectoryHash === 'v1') {
+      logger.info('Welcome back!');
+      return;
+    }
+    if (installDirectoryHash) {
+      logger.info('Welcome back! Updating your dependencies to the latest version of Snowpack...');
+    } else {
+      logger.info(
+        'Welcome to Snowpack! Since this is your first run in this project, we will go ahead and set up your dependencies. This may take a second...',
+      );
+    }
+    const PACKAGE_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'pkg/');
+    const installTargets = await getInstallTargets(
+      config,
+      config.packageOptions.source === 'local' ? config.packageOptions.knownEntrypoints : [],
+    );
+    if (installTargets.length === 0) {
+      logger.info('Nothing to install.');
+      return;
+    }
+    const allResolvedImports: string[] = [...new Set(installTargets.map((t) => t.specifier))]
+      .map((spec) =>
+        this.resolvePackageImport(path.join(config.root, 'package.json'), spec, config),
+      )
+      .filter((v): v is string => typeof v === 'string');
+    await Promise.all(
+      allResolvedImports.map((resolvedSpecUrl) => {
+        return this.load(resolvedSpecUrl.substr(PACKAGE_PATH_PREFIX.length), commandOptions);
+      }),
+    );
+    await fs.writeFile(installDirectoryHashLoc, 'v1', 'utf-8');
+    logger.info('Set up complete!');
+    return;
+
+    //  2. Install dependencies, based on the scan of your final build.
+    // const installResult = await installRunner({
+    //   config,
+    //   installTargets,
+    //   installOptions,
+    //   shouldPrintStats: false,
+    // });
+    //  await updateLockfileHash(DEV_DEPENDENCIES_DIR);
+    //  return installResult;
+    //     installTargets = await getInstallTargets(config, []);
     // const {config} = commandOptions;
     // Set the proper install options, in case an install is needed.
     // logger.debug(`Using cache folder: ${path.relative(config.root, DEV_DEPENDENCIES_DIR)}`);
@@ -271,6 +352,8 @@ export default {
       packageLookupFields: ['svelte'],
     });
     const rootPackageDirectory = getRootPackageDirectory(entrypoint);
+    const rootNodeModulesDirectory = getRootNodeModulesDirectory(entrypoint);
+    console.log(entrypoint, rootPackageDirectory, rootNodeModulesDirectory);
     const entrypointPackageManifestLoc = path.join(rootPackageDirectory, 'package.json');
     const entrypointPackageManifest = JSON.parse(
       readFileSync(entrypointPackageManifestLoc!, 'utf8'),
@@ -279,8 +362,8 @@ export default {
     const hash =
       'local' +
       ':' +
-      crypto.createHash('md5').update(rootPackageDirectory).digest('hex').substr(0, 16);
-    allHashes[hash] = rootPackageDirectory;
+      crypto.createHash('md5').update(rootNodeModulesDirectory).digest('hex').substr(0, 16);
+    allHashes[hash] = rootNodeModulesDirectory;
 
     // const installDest = path.join(
     //   DEV_DEPENDENCIES_DIR,
@@ -317,6 +400,7 @@ export default {
     //   );
     // }
 
+    console.log(allHashes);
     return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', hash, spec);
   },
 

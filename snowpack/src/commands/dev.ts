@@ -1,41 +1,13 @@
-/**
- * This license applies to parts of this file originating from the
- * https://github.com/lukejacksonn/servor repository:
- *
- * MIT License
- * Copyright (c) 2019 Luke Jackson
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
-import cacache from 'cacache';
 import isCompressible from 'compressible';
-import {createLoader as createServerRuntime} from '../ssr-loader';
 import etag from 'etag';
 import {EventEmitter} from 'events';
 import {createReadStream, promises as fs, statSync} from 'fs';
+import {glob} from 'glob';
 import http from 'http';
 import http2 from 'http2';
-import {isBinaryFile} from 'isbinaryfile';
 import * as colors from 'kleur/colors';
 import mime from 'mime-types';
-import os, {tmpdir} from 'os';
+import os from 'os';
 import path from 'path';
 import {performance} from 'perf_hooks';
 import onProcessExit from 'signal-exit';
@@ -50,8 +22,8 @@ import {
   wrapImportMeta,
   wrapImportProxy,
 } from '../build/build-import-proxy';
-import {buildFile, getInputsFromOutput} from '../build/build-pipeline';
-import {getUrlsForFile, getMountEntryForFile} from '../build/file-urls';
+import {buildFile} from '../build/build-pipeline';
+import {getMountEntryForFile, getUrlsForFile} from '../build/file-urls';
 import {createImportResolver} from '../build/import-resolver';
 import {EsmHmrEngine} from '../hmr-server-engine';
 import {logger} from '../logger';
@@ -61,40 +33,30 @@ import {
   transformFileImports,
 } from '../rewrite-imports';
 import {matchDynamicImportValue} from '../scan-imports';
+import {getPackageSource} from '../sources/util';
+import {createLoader as createServerRuntime} from '../ssr-loader';
 import {
   CommandOptions,
   LoadResult,
-  MountEntry,
   OnFileChangeCallback,
   RouteConfigObject,
-  SnowpackConfig,
-  SnowpackSourceFile,
-  SnowpackBuildMap,
-  SnowpackDevServer,
   ServerRuntime,
+  SnowpackBuildMap,
   SnowpackBuiltFile,
+  SnowpackConfig,
+  SnowpackDevServer,
+  SnowpackSourceFile,
 } from '../types';
 import {
-  BUILD_CACHE,
-  cssSourceMappingURL,
-  getExtensionMatch,
   hasExtension,
   HMR_CLIENT_CODE,
   HMR_OVERLAY_CODE,
-  isFsEventsEnabled,
   isRemoteUrl,
-  jsSourceMappingURL,
   openInBrowser,
-  readFile,
   relativeURL,
-  removeExtension,
   replaceExtension,
 } from '../util';
 import {getPort, getServerInfoMessage, paintDashboard, paintEvent} from './paint';
-import {getPackageSource} from '../sources/util';
-import mkdirp from 'mkdirp';
-import rimraf from 'rimraf';
-import {glob} from 'glob';
 
 class OneToManyMap {
   private keyToValue = new Map<string, string[]>();
@@ -124,7 +86,7 @@ class OneToManyMap {
 }
 
 interface FoundFile {
-  loc: string | undefined;
+  loc: string;
   type: string;
   contents: Buffer;
   isStatic: boolean;
@@ -348,20 +310,17 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
   }
 
   const inMemoryBuildCache = new Map<string, FileBuilder>();
-  const filesBeingDeleted = new Set<string>();
-  // const filesBeingBuilt = new Map<string, Promise<SnowpackBuildMap>>();
-  let mountedFiles = new OneToManyMap();
+  let fileToUrlMapping = new OneToManyMap();
 
   for (const [mountKey, mountEntry] of Object.entries(config.mount)) {
     logger.debug(`Mounting directory: '${mountKey}' as URL '${mountEntry.url}'`);
     const files = glob.sync(path.join(mountKey, '**'), {nodir: true});
     for (const f of files) {
-      mountedFiles.add(f, getUrlsForFile(f, config)!);
+      fileToUrlMapping.add(f, getUrlsForFile(f, config)!);
     }
   }
 
-  console.log('DONE', mountedFiles);
-  logger.debug(`Using in-memory cache.`);
+  logger.debug(`Using in-memory cache: ${fileToUrlMapping}`);
 
   await pkgSource.prepare(commandOptions);
   const readCredentials = async (cwd: string) => {
@@ -602,7 +561,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       type: string,
       reqUrlHmrParam: string | false,
     ): Promise<string | Buffer> {
-      const {code, map} = this.verifyRequestFromBuild(type);
+      const {code /*, map */} = this.verifyRequestFromBuild(type);
       let finalResponse = code;
       // Handle attached CSS.
       if (type === '.js' && this.output['.css']) {
@@ -657,7 +616,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       return finalResponse;
     }
 
-    getSourceMap(type: string): string | undefined {
+    async getSourceMap(type: string): Promise<string | undefined> {
       return this.output[type].map;
     }
     async getProxy(url: string, type: string) {
@@ -696,7 +655,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     {
       isSSR: _isSSR,
       isHMR: _isHMR,
-      allowStale: _allowStale,
       encoding: _encoding,
     }: {
       isSSR?: boolean;
@@ -708,7 +666,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     const isSSR = _isSSR ?? false;
     //   // Default to HMR on, but disable HMR if SSR mode is enabled.
     const isHMR = _isHMR ?? ((config.devOptions.hmr ?? true) && !isSSR);
-    const allowStale = _allowStale ?? false;
     const encoding = _encoding ?? null;
     const reqUrlHmrParam = reqUrl.includes('?mtime=') && reqUrl.split('?')[1];
     const reqPath = decodeURI(url.parse(reqUrl).pathname!);
@@ -747,16 +704,20 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
 
     const attemptedFileLoc =
-      mountedFiles.key(resourcePath) ||
-      mountedFiles.key(resourcePath + '.html') ||
-      mountedFiles.key(resourcePath + 'index.html') ||
-      mountedFiles.key(resourcePath + '/index.html');
+      fileToUrlMapping.key(resourcePath) ||
+      fileToUrlMapping.key(resourcePath + '.html') ||
+      fileToUrlMapping.key(resourcePath + 'index.html') ||
+      fileToUrlMapping.key(resourcePath + '/index.html');
     if (!attemptedFileLoc) {
       throw new NotFoundError([reqPath]);
     }
 
     const [, mountEntry] = getMountEntryForFile(attemptedFileLoc, config)!;
-    const foundFile = {
+
+    // TODO: This data type structuring/destructuring is unesccesary for now,
+    // but we hope to add "virtual file" support soon via plugins. This would
+    // be the interface for those response types.
+    const foundFile: FoundFile = {
       loc: attemptedFileLoc,
       type: path.extname(reqPath) || '.html',
       contents: await fs.readFile(attemptedFileLoc),
@@ -764,21 +725,10 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       isResolve: mountEntry.resolve,
     };
 
-    function handleFinalizeError(err: Error) {
-      logger.error(FILE_BUILD_RESULT_ERROR);
-      hmrEngine.broadcastMessage({
-        type: 'error',
-        title: FILE_BUILD_RESULT_ERROR,
-        errorMessage: err.toString(),
-        fileLoc,
-        errorStackTrace: err.stack,
-      });
-    }
-
     const {
       loc: fileLoc,
       type: responseType,
-      contents: responseContents,
+      // contents: responseContents,
       isStatic: _isStatic,
       isResolve,
     } = foundFile;
@@ -796,17 +746,39 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       await fileBuilder.build();
     }
 
+    function handleFinalizeError(err: Error) {
+      logger.error(FILE_BUILD_RESULT_ERROR);
+      hmrEngine.broadcastMessage({
+        type: 'error',
+        title: FILE_BUILD_RESULT_ERROR,
+        errorMessage: err.toString(),
+        fileLoc,
+        errorStackTrace: err.stack,
+      });
+    }
+
     let finalizedResponse: string | Buffer;
     if (reqUrl.endsWith('.proxy.js')) {
-      finalizedResponse = await fileBuilder.getProxy(resourcePath, resourceType);
+      finalizedResponse = await fileBuilder.getProxy(resourcePath, resourceType).catch((err) => {
+        handleFinalizeError(err);
+        throw err;
+      });
     } else if (reqUrl.endsWith('.proxy.js')) {
-      const _finalizedResponse = await fileBuilder.getSourceMap(resourcePath);
+      const _finalizedResponse = await fileBuilder.getSourceMap(resourcePath).catch((err) => {
+        handleFinalizeError(err);
+        throw err;
+      });
       if (!_finalizedResponse) {
         throw new NotFoundError([reqPath]);
       }
       finalizedResponse = _finalizedResponse;
     } else {
-      finalizedResponse = await fileBuilder.getResult(reqPath, resourceType, reqUrlHmrParam);
+      finalizedResponse = await fileBuilder
+        .getResult(reqPath, resourceType, reqUrlHmrParam)
+        .catch((err) => {
+          handleFinalizeError(err);
+          throw err;
+        });
     }
 
     return {
@@ -1049,18 +1021,18 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
 
   const watcher = chokidar.watch(Object.keys(config.mount), {
     persistent: true,
-    ignoreInitial: false,
+    ignoreInitial: true,
     disableGlobbing: false,
   });
   watcher.on('add', (fileLoc) => {
     knownETags.clear();
     onWatchEvent(fileLoc);
-    mountedFiles.add(fileLoc, getUrlsForFile(fileLoc, config)!);
+    fileToUrlMapping.add(fileLoc, getUrlsForFile(fileLoc, config)!);
   });
   watcher.on('unlink', (fileLoc) => {
     knownETags.clear();
     onWatchEvent(fileLoc);
-    mountedFiles.delete(fileLoc);
+    fileToUrlMapping.delete(fileLoc);
   });
   watcher.on('change', (fileLoc) => {
     onWatchEvent(fileLoc);

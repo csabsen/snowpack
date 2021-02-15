@@ -147,6 +147,7 @@ async function installPackageEntrypoint({
 // this implementation detail around outside of this interface.
 // Can't add it to the exported interface due to TS.
 let config: SnowpackConfig;
+let needsDeepResolve = new Set<string>();
 
 let installTargets: InstallTarget[] = [];
 const allHashes: Record<string, string> = {};
@@ -159,16 +160,21 @@ export default {
   async load(id: string): Promise<Buffer | string> {
     const PACKAGE_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'pkg/');
     const idParts = id.split('/');
-    let hash = idParts.shift()!;
-    if (hash.startsWith('@')) {
-      hash += '/' + idParts.shift()!;
-    }
     idParts.shift(); // remove "-"
+    const hash = idParts.shift()!;
+    const hashParts = hash.split(':');
+    let packageName = hashParts.shift()!;
+    if (packageName.startsWith('@')) {
+      packageName += '/' + hashParts.shift()!;
+    }
+    const packageVersion = hashParts.shift()!;
+    const spec = hashParts.join('/');
+
+    console.log(packageName, packageVersion, spec);
     const rootPackageDirectory = allHashes[hash];
     const entrypointPackageManifestLoc = path.join(rootPackageDirectory, 'package.json');
-    const spec = idParts.join('/');
 
-    const installDest = path.join(DEV_DEPENDENCIES_DIR, hash);
+    const installDest = path.join(DEV_DEPENDENCIES_DIR, packageName + '@' + packageVersion);
     const dependencyFileLoc = path.join(installDest, spec);
     let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
     const allResolvedImports = new Set<string>();
@@ -262,50 +268,54 @@ export default {
       DEV_DEPENDENCIES_DIR,
       packageManifest.name + '@' + packageManifest.version,
     );
-    allHashes[hash] = allHashes[hash] || rootPackageDirectory;
 
-    const existingImportMap =
-      (await fs.stat(installDest).catch(() => null)) &&
-      JSON.parse((await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!);
-    const existingIntegrityHash = await fs
-      .readFile(path.join(installDest, '.meta'), 'utf-8')
-      .catch(() => null);
-    const doesInstalledPackageExist = !!existingImportMap;
-    const isInstalledPackageStale =
-      doesInstalledPackageExist && newIntegrityHash !== existingIntegrityHash;
-    const existingEntrypoint = existingImportMap && existingImportMap.imports[spec];
-    if (isInstalledPackageStale && existingEntrypoint) {
-      return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', hash, `-`, existingEntrypoint);
-    }
-
-    const newImportMap = await inProgress.add(() =>
-      installPackageEntrypoint({
+    const [isNew, newImportMap] = await inProgress.add(async () => {
+      const existingImportMap =
+        (await fs.stat(installDest).catch(() => null)) &&
+        JSON.parse((await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!);
+      const existingIntegrityHash = await fs
+        .readFile(path.join(installDest, '.meta'), 'utf-8')
+        .catch(() => null);
+      const doesInstalledPackageExist = !!existingImportMap;
+      const isInstalledPackageStale =
+        !doesInstalledPackageExist || newIntegrityHash !== existingIntegrityHash;
+      const existingEntrypoint = existingImportMap && existingImportMap.imports[spec];
+      console.log(existingEntrypoint, !doesInstalledPackageExist, isInstalledPackageStale);
+      if (!isInstalledPackageStale && existingEntrypoint) {
+        return [false, existingImportMap];
+      }
+      return [true, await installPackageEntrypoint({
         installDest,
         spec,
         packageManifest,
         packageManifestLoc,
         importMap: existingImportMap,
-      }),
-    );
+      })];
+    });
     await fs.writeFile(path.join(installDest, '.meta'), newIntegrityHash, 'utf8');
     await inProgress.onIdle();
 
-    const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
-    let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
-    for (const imp of await scanCodeImportsExports(installedPackageCode)) {
-      inProgress.add(() =>
-        this.resolvePackageImport(entrypoint, installedPackageCode.substring(imp.s, imp.e), config),
+    if (isNew) {
+      const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
+      let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
+      const packageImports = new Set<string>();
+      for (const imp of await scanCodeImportsExports(installedPackageCode)) {
+        packageImports.add(installedPackageCode.substring(imp.s, imp.e));
+      }
+      console.log(packageImports);
+      await Promise.all(
+        [...packageImports].map((packageImport) =>
+          this.resolvePackageImport(entrypoint, packageImport, config),
+        ),
       );
+      await inProgress.onIdle();
     }
-    await inProgress.onIdle();
 
-    return path.posix.join(
-      config.buildOptions.metaUrlPath,
-      'pkg',
-      hash,
-      `-`,
-      newImportMap.imports[spec],
-    );
+    const flattedSpec = path.posix
+      .join(packageName, packageVersion, newImportMap.imports[spec])
+      .replace(/\//g, ':');
+    allHashes[flattedSpec] = allHashes[flattedSpec] || rootPackageDirectory;
+    return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', `-`, flattedSpec);
   },
 
   clearCache() {

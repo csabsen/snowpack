@@ -58,6 +58,15 @@ function getRootPackageDirectory(loc: string) {
   }
 }
 
+// IDEA:
+// maintain mapping outside of this function: installDest => entrypoints
+  // this function just reads from it
+// maintain set of installDest that need rebuilding: new Set()
+// maintain a queue of generic worker, that works through this
+
+const installDestEntrypoints = new Map<string, string>();
+const installDestNeedRebuild = new Set<string>();
+
 async function installPackageEntrypoint({
   installDest,
   spec,
@@ -150,7 +159,10 @@ let config: SnowpackConfig;
 let needsDeepResolve = new Set<string>();
 
 let installTargets: InstallTarget[] = [];
-const allHashes: Record<string, string> = {};
+const allHashes: Record<
+  string,
+  {packageName: string; packageVersion: string; entrypoint: string; loc: string}
+> = {};
 const inProgress = new PQueue({concurrency: 1});
 /**
  * Local Package Source: A generic interface through which Snowpack
@@ -171,16 +183,11 @@ export default {
     const spec = hashParts.join('/');
 
     console.log(packageName, packageVersion, spec);
-    const rootPackageDirectory = allHashes[hash];
-    const entrypointPackageManifestLoc = path.join(rootPackageDirectory, 'package.json');
-
-    const installDest = path.join(DEV_DEPENDENCIES_DIR, packageName + '@' + packageVersion);
-    const dependencyFileLoc = path.join(installDest, spec);
-    let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
-    const allResolvedImports = new Set<string>();
+    const {loc, entrypoint} = allHashes[hash];
+    let installedPackageCode = await fs.readFile(loc, 'utf8');
     installedPackageCode = await transformAddMissingDefaultExport(installedPackageCode);
     installedPackageCode = await transformFileImports(
-      {type: path.extname(dependencyFileLoc), contents: installedPackageCode},
+      {type: path.extname(loc), contents: installedPackageCode},
       async (spec) => {
         if (isRemoteUrl(spec)) {
           return spec;
@@ -188,16 +195,8 @@ export default {
         if (spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/')) {
           return spec;
         }
-        const resolvedSpecUrl = await this.resolvePackageImport(
-          entrypointPackageManifestLoc,
-          spec,
-          config,
-        );
-        if (!resolvedSpecUrl) {
-          return spec;
-        }
-        allResolvedImports.add(resolvedSpecUrl.substr(PACKAGE_PATH_PREFIX.length));
-        return resolvedSpecUrl;
+        const resolvedSpecUrl = await this.resolvePackageImport(entrypoint, spec, config);
+        return resolvedSpecUrl || spec;
       },
     );
     return installedPackageCode;
@@ -263,7 +262,6 @@ export default {
     const packageManifest = JSON.parse(packageManifestStr);
     const newIntegrityHash = etag(packageManifestStr);
     const {name: packageName, version: packageVersion} = packageManifest;
-    const hash = packageName + '@' + packageVersion;
     const installDest = path.join(
       DEV_DEPENDENCIES_DIR,
       packageManifest.name + '@' + packageManifest.version,
@@ -284,23 +282,33 @@ export default {
       if (!isInstalledPackageStale && existingEntrypoint) {
         return [false, existingImportMap];
       }
-      return [true, await installPackageEntrypoint({
-        installDest,
-        spec,
-        packageManifest,
-        packageManifestLoc,
-        importMap: existingImportMap,
-      })];
+      return [
+        true,
+        await installPackageEntrypoint({
+          installDest,
+          spec,
+          packageManifest,
+          packageManifestLoc,
+          importMap: existingImportMap,
+        }),
+      ];
     });
     await fs.writeFile(path.join(installDest, '.meta'), newIntegrityHash, 'utf8');
     await inProgress.onIdle();
+    const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
 
     if (isNew) {
-      const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
       let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
       const packageImports = new Set<string>();
       for (const imp of await scanCodeImportsExports(installedPackageCode)) {
-        packageImports.add(installedPackageCode.substring(imp.s, imp.e));
+        const spec = installedPackageCode.substring(imp.s, imp.e);
+        if (isRemoteUrl(spec)) {
+          return;
+        }
+        if (spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/')) {
+          return;
+        }
+        packageImports.add(spec);
       }
       console.log(packageImports);
       await Promise.all(
@@ -311,10 +319,11 @@ export default {
       await inProgress.onIdle();
     }
 
-    const flattedSpec = path.posix
-      .join(packageName, packageVersion, newImportMap.imports[spec])
-      .replace(/\//g, ':');
-    allHashes[flattedSpec] = allHashes[flattedSpec] || rootPackageDirectory;
+    const flattedSpec = newImportMap.imports[spec]
+      .replace(/\//g, '.')
+      .replace(/^\.+/g, '')
+      .replace(/\.([^\.]*?)$/, `.v${packageVersion}.$1`);
+      allHashes[flattedSpec] = {packageName, packageVersion, entrypoint, loc: dependencyFileLoc};
     return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', `-`, flattedSpec);
   },
 

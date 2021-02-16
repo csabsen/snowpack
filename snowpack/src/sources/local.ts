@@ -12,7 +12,6 @@ import {buildFile} from '../build/build-pipeline';
 import {logger} from '../logger';
 import {
   scanCodeImportsExports,
-  transformAddMissingDefaultExport,
   transformFileImports,
 } from '../rewrite-imports';
 import {getInstallTargets} from '../scan-imports';
@@ -59,7 +58,9 @@ async function installPackageEntrypoint({
   packageManifest: any;
   packageManifestLoc: string;
 }): Promise<ImportMap> {
-  let installEntrypoints = [...allKnownSpecs];
+  let installEntrypoints = [...allKnownSpecs].filter(
+    (spec) => spec === packageManifest.name || spec.startsWith(packageManifest.name + '/'),
+  );
   // TODO: external should be a function in esinstall
   const external = [
     ...Object.keys(packageManifest.dependencies || {}),
@@ -122,16 +123,15 @@ async function installPackageEntrypoint({
 // Can't add it to the exported interface due to TS.
 let config: SnowpackConfig;
 
-const allHashes: Record<
-  string,
-  {
-    entrypoint: string;
-    loc: string;
-    installDest: string;
-    packageVersion: string;
-  }
-> = {};
-const inProgress = new PQueue({concurrency: 1});
+type FoundHash = {
+  entrypoint: string;
+  loc: string;
+  installDest: string;
+  packageVersion: string;
+  packageName: string;
+};
+const allHashes: Record<string, FoundHash> = {};
+const inProgress = new PQueue({concurrency: 5});
 const inProgressRunning = new Map<string, Promise<ImportMap>>();
 const allKnownSpecs = new Set<string>();
 
@@ -141,22 +141,17 @@ const allKnownSpecs = new Set<string>();
  */
 export default {
   async load(id: string): Promise<Buffer | string> {
-    console.log('ID', id);
-    // const PACKAGE_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'pkg/');
     const idParts = id.split('/');
-    idParts.shift(); // remove "-"
-    const hash = idParts.shift()!;
-    // const hashParts = hash.split(':');
-    // let packageName = hashParts.shift()!;
-    // if (packageName.startsWith('@')) {
-    //   packageName += '/' + hashParts.shift()!;
-    // }
-    // const packageVersion = hashParts.shift()!;
-    // const spec = hashParts.join('/');
-    // console.log('B', packageName, packageVersion, spec);
-    console.log(allHashes, hash);
-    const {loc, entrypoint, installDest} = allHashes[hash];
-    await (inProgressRunning.get(installDest) || Promise.resolve());
+    let foundHash: FoundHash;
+    if (idParts.length === 1) {
+      const hash = idParts[0];
+      foundHash = allHashes[hash]!;
+    } else {
+      const hash = idParts.join('/');
+      foundHash = allHashes[hash]!;
+    }
+    const {loc, entrypoint, installDest, packageName, packageVersion} = foundHash;
+    await inProgress.onIdle();
     let installedPackageCode = await fs.readFile(loc, 'utf8');
     installedPackageCode = await transformFileImports(
       {type: path.extname(loc), contents: installedPackageCode},
@@ -167,14 +162,26 @@ export default {
         if (spec.startsWith('/')) {
           return spec;
         }
+        // These are a bit tricky: 
         if (spec.startsWith('./') || spec.startsWith('../')) {
           const newLoc = path.resolve(path.dirname(loc), spec);
-          const resolvedSpec   = './' + path.relative(installDest, newLoc)
-          const importMap = JSON.parse(await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'));
-          const foundEntrypoint = Object.entries(importMap.imports).find(([k, v]) => v === resolvedSpec);
-          console.log('FOUND', resolvedSpec, foundEntrypoint);
+          const resolvedSpec = path.relative(installDest, newLoc);
+          const importMap = JSON.parse(
+            await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'),
+          );
+          const foundEntrypoint = Object.entries(importMap.imports).find(
+            ([k, v]) => v === './' + resolvedSpec,
+          );
+          const hash = path.join(`${packageName}.v${packageVersion}`, resolvedSpec);
           if (!foundEntrypoint) {
-            return spec;
+            allHashes[hash] = {
+              entrypoint: path.join(installDest, 'package.json'),
+              loc: newLoc,
+              installDest,
+              packageVersion,
+              packageName,
+            };
+            return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', hash);
           }
           spec = foundEntrypoint[0];
         }
@@ -244,7 +251,6 @@ export default {
     const packageManifestLoc = path.join(rootPackageDirectory, 'package.json');
     const packageManifestStr = await fs.readFile(packageManifestLoc, 'utf8');
     const packageManifest = JSON.parse(packageManifestStr);
-    // const newIntegrityHash = etag(packageManifestStr);
     const {name: packageName, version: packageVersion} = packageManifest;
     const installDest = path.join(DEV_DEPENDENCIES_DIR, packageName + '@' + packageVersion);
 
@@ -287,7 +293,7 @@ export default {
         });
         inProgressRunning.set(installDest, installPackagePromise);
         const newImportMap = await installPackagePromise;
-        console.log(`Installing ${spec}... DONE`);
+        console.log(`Installing ${spec}... DONE`, Object.keys(newImportMap.imports));
         inProgressRunning.delete(installDest);
         return newImportMap;
       },
@@ -295,6 +301,7 @@ export default {
 
     const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
     if (isNew) {
+      await inProgress.onIdle();
       let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
       const packageImports = new Set<string>();
       for (const imp of await scanCodeImportsExports(installedPackageCode)) {
@@ -315,17 +322,17 @@ export default {
     }
 
     const flattedSpec = newImportMap.imports[spec]
-    .replace(/\//g, '.')
-    .replace(/^\.+/g, '')
-    .replace(/\.([^\.]*?)$/, `.v${packageVersion}.$1`);
-    console.log(spec, '->', flattedSpec);
+      .replace(/\//g, '.')
+      .replace(/^\.+/g, '')
+      .replace(/\.([^\.]*?)$/, `.v${packageVersion}.$1`);
     allHashes[flattedSpec] = {
       entrypoint,
       loc: dependencyFileLoc,
       installDest,
       packageVersion,
+      packageName,
     };
-    return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', `-`, flattedSpec);
+    return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', flattedSpec);
   },
 
   clearCache() {

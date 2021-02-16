@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import {install as esinstall, resolveEntrypoint} from 'esinstall';
 import projectCacheDir from 'find-cache-dir';
-import {existsSync, promises as fs, readFileSync} from 'fs';
+import {promises as fs} from 'fs';
 import PQueue from 'p-queue';
 import path from 'path';
 import rimraf from 'rimraf';
@@ -10,13 +10,10 @@ import url from 'url';
 import util from 'util';
 import {buildFile} from '../build/build-pipeline';
 import {logger} from '../logger';
-import {
-  scanCodeImportsExports,
-  transformFileImports,
-} from '../rewrite-imports';
+import {scanCodeImportsExports, transformFileImports} from '../rewrite-imports';
 import {getInstallTargets} from '../scan-imports';
 import {CommandOptions, ImportMap, PackageSource, SnowpackConfig} from '../types';
-import {GLOBAL_CACHE_DIR, isRemoteUrl} from '../util';
+import {GLOBAL_CACHE_DIR, isJavaScript, isRemoteUrl} from '../util';
 
 const PROJECT_CACHE_DIR =
   projectCacheDir({name: 'snowpack'}) ||
@@ -26,17 +23,6 @@ const PROJECT_CACHE_DIR =
   path.join(GLOBAL_CACHE_DIR, crypto.createHash('md5').update(process.cwd()).digest('hex'));
 
 const DEV_DEPENDENCIES_DIR = path.join(PROJECT_CACHE_DIR, process.env.NODE_ENV || 'development');
-
-/**
- * Sanitizes npm packages that end in .js (e.g `tippy.js` -> `tippyjs`).
- * This is necessary because Snowpack can’t create both a file and directory
- * that end in .js.
- */
-export function sanitizePackageName(filepath: string): string {
-  const dirs = filepath.split('/');
-  const file = dirs.pop() as string;
-  return [...dirs.map((path) => path.replace(/\.js$/i, 'js')), file].join('/');
-}
 
 function getRootPackageDirectory(loc: string) {
   const parts = loc.split('node_modules');
@@ -49,7 +35,7 @@ function getRootPackageDirectory(loc: string) {
   }
 }
 
-async function installPackageEntrypoint({
+async function installPackage({
   installDest,
   packageManifest,
   packageManifestLoc,
@@ -123,17 +109,16 @@ async function installPackageEntrypoint({
 // Can't add it to the exported interface due to TS.
 let config: SnowpackConfig;
 
-type FoundHash = {
+type PackageImportData = {
   entrypoint: string;
   loc: string;
   installDest: string;
   packageVersion: string;
   packageName: string;
 };
-const allHashes: Record<string, FoundHash> = {};
-const inProgress = new PQueue({concurrency: 5});
-const inProgressRunning = new Map<string, Promise<ImportMap>>();
+const allPackageImports: Record<string, PackageImportData> = {};
 const allKnownSpecs = new Set<string>();
+const inProgressBuilds = new PQueue({concurrency: 1});
 
 /**
  * Local Package Source: A generic interface through which Snowpack
@@ -141,54 +126,55 @@ const allKnownSpecs = new Set<string>();
  */
 export default {
   async load(id: string): Promise<Buffer | string> {
-    const idParts = id.split('/');
-    let foundHash: FoundHash;
-    if (idParts.length === 1) {
-      const hash = idParts[0];
-      foundHash = allHashes[hash]!;
-    } else {
-      const hash = idParts.join('/');
-      foundHash = allHashes[hash]!;
-    }
-    const {loc, entrypoint, installDest, packageName, packageVersion} = foundHash;
-    await inProgress.onIdle();
-    let installedPackageCode = await fs.readFile(loc, 'utf8');
-    installedPackageCode = await transformFileImports(
-      {type: path.extname(loc), contents: installedPackageCode},
-      async (spec) => {
+    const packageImport = allPackageImports[id];
+    const {loc, entrypoint, installDest, packageName, packageVersion} = packageImport;
+    // Wait for any in progress builds to complete, in case they've
+    // cleared out the directory that you're trying to read out of.
+    await inProgressBuilds.onIdle();
+    let packageCode = await fs.readFile(loc, 'utf8');
+    const packageImportMap = JSON.parse(
+      await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'),
+    );
+    packageCode = await transformFileImports(
+      {type: path.extname(loc), contents: packageCode},
+      async (spec): Promise<string> => {
         if (isRemoteUrl(spec)) {
           return spec;
         }
         if (spec.startsWith('/')) {
           return spec;
         }
-        // These are a bit tricky: 
+        // These are a bit tricky: relative paths within packages always point to
+        // relative files within the built package (ex: 'pkg/common/XXX-hash.js`).
+        // We resolve these to a new kind of "internal" import URL that's different
+        // from the normal, flattened URL for public imports.
         if (spec.startsWith('./') || spec.startsWith('../')) {
           const newLoc = path.resolve(path.dirname(loc), spec);
           const resolvedSpec = path.relative(installDest, newLoc);
-          const importMap = JSON.parse(
-            await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'),
+          const publicImportEntry = Object.entries(packageImportMap.imports).find(
+            ([, v]) => v === './' + resolvedSpec,
           );
-          const foundEntrypoint = Object.entries(importMap.imports).find(
-            ([k, v]) => v === './' + resolvedSpec,
-          );
-          const hash = path.join(`${packageName}.v${packageVersion}`, resolvedSpec);
-          if (!foundEntrypoint) {
-            allHashes[hash] = {
-              entrypoint: path.join(installDest, 'package.json'),
-              loc: newLoc,
-              installDest,
-              packageVersion,
-              packageName,
-            };
-            return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', hash);
+          // If this matches the destination of a public package import, resolve to it.
+          if (publicImportEntry) {
+            spec = publicImportEntry[0];
+            return await this.resolvePackageImport(entrypoint, spec, config);
           }
-          spec = foundEntrypoint[0];
+          // Otherwise, create a relative import ID for the internal file.
+          const relativeImportId = path.join(`${packageName}.v${packageVersion}`, resolvedSpec);
+          allPackageImports[relativeImportId] = {
+            entrypoint: path.join(installDest, 'package.json'),
+            loc: newLoc,
+            installDest,
+            packageVersion,
+            packageName,
+          };
+          return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', relativeImportId);
         }
+        // Otherwise, resolve this specifier as an external package.
         return await this.resolvePackageImport(entrypoint, spec, config);
       },
     );
-    return installedPackageCode;
+    return packageCode;
   },
 
   modifyBuildInstallOptions({installOptions, config}) {
@@ -241,7 +227,6 @@ export default {
     return;
   },
 
-  // TODO: Make async, and then clean all of this up
   async resolvePackageImport(source: string, spec: string, config: SnowpackConfig) {
     const entrypoint = resolveEntrypoint(spec, {
       cwd: path.dirname(source),
@@ -256,60 +241,43 @@ export default {
 
     let isNew = !allKnownSpecs.has(spec);
     allKnownSpecs.add(spec);
-    const newImportMap = await inProgress.add(
-      async (): Promise<ImportMap> => {
-        // If an install is already in progress, wait for that to finish and check that result first.
-        // We use a "while" here because many requests to the same package may get backed up here while
-        // waiting. If they all fail to match the original on completion, the while loop ensures that
-        // only one will
-        while (inProgressRunning.has(installDest)) {
-          console.log(spec, 'CACHED! (already running)');
-          const newImportMap = await inProgressRunning.get(installDest);
-          if (newImportMap?.imports[spec]) {
-            return newImportMap;
-          }
-        }
-
-        // Note(fks): The rest of this function must by synchronous, to make sure that multiple builds don't
-        // kick off at once. If a build breaks out of the while loop, it must be a straight, syncronous
-        // shot to the step below where it re-adds a job to the inProgressRunning map.
-        // TODO(fks): There's probably a smarter way to organize this that removes the sync requirement.
-
-        // Look up the import map of the installed package, and check if this specifier now exists.
+    const [newImportMap, loadedFile] = await inProgressBuilds.add(
+      async (): Promise<[ImportMap, Buffer]> => {
+        // Look up the import map of the already-installed package.
+        // If spec already exists, then this import map is valid.
         const existingImportMapLoc = path.join(installDest, 'import-map.json');
         const existingImportMap =
-          existsSync(existingImportMapLoc) &&
-          JSON.parse(readFileSync(existingImportMapLoc, 'utf8')!);
+          (await fs.stat(existingImportMapLoc).catch(() => null)) &&
+          JSON.parse(await fs.readFile(existingImportMapLoc, 'utf8'));
         if (existingImportMap && existingImportMap.imports[spec]) {
           console.log(spec, 'CACHED! (already exists)');
-          return existingImportMap;
+          const dependencyFileLoc = path.join(installDest, existingImportMap.imports[spec]);
+          return [existingImportMap, await fs.readFile(dependencyFileLoc!)];
         }
-        // Otherwise, kick off a new build!
+        // Otherwise, kick off a new build to generate a fresh import map.
         console.log(`Installing ${spec}...`);
-        const installPackagePromise = installPackageEntrypoint({
+        const newImportMap = await installPackage({
           installDest,
           packageManifest,
           packageManifestLoc,
         });
-        inProgressRunning.set(installDest, installPackagePromise);
-        const newImportMap = await installPackagePromise;
         console.log(`Installing ${spec}... DONE`, Object.keys(newImportMap.imports));
-        inProgressRunning.delete(installDest);
-        return newImportMap;
+        const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
+        return [newImportMap, await fs.readFile(dependencyFileLoc!)];
       },
     );
 
     const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
-    if (isNew) {
-      await inProgress.onIdle();
-      let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
+    if (isNew && isJavaScript(dependencyFileLoc)) {
+      await inProgressBuilds.onIdle();
       const packageImports = new Set<string>();
-      for (const imp of await scanCodeImportsExports(installedPackageCode)) {
-        const spec = installedPackageCode.substring(imp.s, imp.e);
+      const code = loadedFile.toString('utf8');
+      for (const imp of await scanCodeImportsExports(code)) {
+        const spec = code.substring(imp.s, imp.e);
         if (isRemoteUrl(spec)) {
           return;
         }
-        if (spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/')) {
+        if (spec.startsWith('/') || spec.startsWith('./') || spec.startsWith('../')) {
           return;
         }
         packageImports.add(spec);
@@ -321,18 +289,20 @@ export default {
       );
     }
 
-    const flattedSpec = newImportMap.imports[spec]
+    // Flatten the import map value into a resolved, public import ID.
+    // ex: "./react.js" -> "react.v17.0.1.js"
+    const importId = newImportMap.imports[spec]
       .replace(/\//g, '.')
       .replace(/^\.+/g, '')
       .replace(/\.([^\.]*?)$/, `.v${packageVersion}.$1`);
-    allHashes[flattedSpec] = {
+    allPackageImports[importId] = {
       entrypoint,
       loc: dependencyFileLoc,
       installDest,
-      packageVersion,
       packageName,
+      packageVersion,
     };
-    return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', flattedSpec);
+    return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', importId);
   },
 
   clearCache() {

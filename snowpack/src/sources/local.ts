@@ -1,15 +1,14 @@
-import {buildFile} from '../build/build-pipeline';
-import url from 'url';
-import etag from 'etag';
 import crypto from 'crypto';
-import {install as esinstall, InstallTarget, resolveEntrypoint} from 'esinstall';
+import {install as esinstall, resolveEntrypoint} from 'esinstall';
 import projectCacheDir from 'find-cache-dir';
 import {existsSync, promises as fs, readFileSync} from 'fs';
 import PQueue from 'p-queue';
 import path from 'path';
 import rimraf from 'rimraf';
-import util from 'util';
 import type {Plugin as RollupPlugin} from 'rollup';
+import url from 'url';
+import util from 'util';
+import {buildFile} from '../build/build-pipeline';
 import {logger} from '../logger';
 import {
   scanCodeImportsExports,
@@ -40,13 +39,6 @@ export function sanitizePackageName(filepath: string): string {
   return [...dirs.map((path) => path.replace(/\.js$/i, 'js')), file].join('/');
 }
 
-function getRootNodeModulesDirectory(loc: string) {
-  const parts = loc.split('node_modules');
-  parts.pop()!;
-  const packageRoot = path.join(parts.join('node_modules'), 'node_modules');
-  return packageRoot;
-}
-
 function getRootPackageDirectory(loc: string) {
   const parts = loc.split('node_modules');
   const packageParts = parts.pop()!.split('/').filter(Boolean);
@@ -58,40 +50,16 @@ function getRootPackageDirectory(loc: string) {
   }
 }
 
-// IDEA:
-// maintain mapping outside of this function: installDest => entrypoints
-  // this function just reads from it
-// maintain set of installDest that need rebuilding: new Set()
-// maintain a queue of generic worker, that works through this
-
-const installDestEntrypoints = new Map<string, string>();
-const installDestNeedRebuild = new Set<string>();
-
 async function installPackageEntrypoint({
   installDest,
-  spec,
   packageManifest,
   packageManifestLoc,
-  importMap,
 }: {
   installDest: string;
   packageManifest: any;
   packageManifestLoc: string;
-  spec: string;
-  importMap: ImportMap;
 }): Promise<ImportMap> {
-  const packageName = packageManifest.name;
-  const existingEntrypoints = importMap ? Object.keys(importMap.imports) : [];
-  let installEntrypoints = Array.from(
-    new Set([
-      ...existingEntrypoints,
-      spec,
-      ...installTargets
-        .map((t) => t.specifier)
-        .filter((t) => t === packageName || t.startsWith(packageName + '/')),
-    ]),
-  );
-  console.log(`Installing ${spec}...`);
+  let installEntrypoints = [...allKnownSpecs];
   // TODO: external should be a function in esinstall
   const external = [
     ...Object.keys(packageManifest.dependencies || {}),
@@ -118,12 +86,12 @@ async function installPackageEntrypoint({
       plugins: [
         {
           name: 'esinstall:snowpack',
-          resolveId(source: string, importer: string | undefined) {
-            // console.log('resolveId', source, importer);
-            return source;
-          },
+          // resolveId(source: string, importer: string | undefined) {
+          // console.log('resolveId()', source);
+          //   return source;
+          // },
           async load(id: string) {
-            // console.log('load', id);
+            // console.log('load()', id);
             const output = await buildFile(url.pathToFileURL(id), {
               config,
               isDev: true,
@@ -131,7 +99,6 @@ async function installPackageEntrypoint({
               isHmrEnabled: false,
             });
             let jsResponse;
-            // console.log(output);
             for (const [outputType, outputContents] of Object.entries(output)) {
               if (jsResponse) {
                 console.log(`load() Err: ${Object.keys(output)}`);
@@ -146,8 +113,6 @@ async function installPackageEntrypoint({
       ],
     },
   });
-  console.log(`Installing ${spec}... DONE`);
-
   return finalResult.importMap;
 }
 
@@ -156,47 +121,64 @@ async function installPackageEntrypoint({
 // this implementation detail around outside of this interface.
 // Can't add it to the exported interface due to TS.
 let config: SnowpackConfig;
-let needsDeepResolve = new Set<string>();
 
-let installTargets: InstallTarget[] = [];
 const allHashes: Record<
   string,
-  {packageName: string; packageVersion: string; entrypoint: string; loc: string}
+  {
+    entrypoint: string;
+    loc: string;
+    installDest: string;
+    packageVersion: string;
+  }
 > = {};
 const inProgress = new PQueue({concurrency: 1});
+const inProgressRunning = new Map<string, Promise<ImportMap>>();
+const allKnownSpecs = new Set<string>();
+
 /**
  * Local Package Source: A generic interface through which Snowpack
  * interacts with esinstall and your locally installed dependencies.
  */
 export default {
   async load(id: string): Promise<Buffer | string> {
-    const PACKAGE_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'pkg/');
+    console.log('ID', id);
+    // const PACKAGE_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'pkg/');
     const idParts = id.split('/');
     idParts.shift(); // remove "-"
     const hash = idParts.shift()!;
-    const hashParts = hash.split(':');
-    let packageName = hashParts.shift()!;
-    if (packageName.startsWith('@')) {
-      packageName += '/' + hashParts.shift()!;
-    }
-    const packageVersion = hashParts.shift()!;
-    const spec = hashParts.join('/');
-
-    console.log(packageName, packageVersion, spec);
-    const {loc, entrypoint} = allHashes[hash];
+    // const hashParts = hash.split(':');
+    // let packageName = hashParts.shift()!;
+    // if (packageName.startsWith('@')) {
+    //   packageName += '/' + hashParts.shift()!;
+    // }
+    // const packageVersion = hashParts.shift()!;
+    // const spec = hashParts.join('/');
+    // console.log('B', packageName, packageVersion, spec);
+    console.log(allHashes, hash);
+    const {loc, entrypoint, installDest} = allHashes[hash];
+    await (inProgressRunning.get(installDest) || Promise.resolve());
     let installedPackageCode = await fs.readFile(loc, 'utf8');
-    installedPackageCode = await transformAddMissingDefaultExport(installedPackageCode);
     installedPackageCode = await transformFileImports(
       {type: path.extname(loc), contents: installedPackageCode},
       async (spec) => {
         if (isRemoteUrl(spec)) {
           return spec;
         }
-        if (spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/')) {
+        if (spec.startsWith('/')) {
           return spec;
         }
-        const resolvedSpecUrl = await this.resolvePackageImport(entrypoint, spec, config);
-        return resolvedSpecUrl || spec;
+        if (spec.startsWith('./') || spec.startsWith('../')) {
+          const newLoc = path.resolve(path.dirname(loc), spec);
+          const resolvedSpec   = './' + path.relative(installDest, newLoc)
+          const importMap = JSON.parse(await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'));
+          const foundEntrypoint = Object.entries(importMap.imports).find(([k, v]) => v === resolvedSpec);
+          console.log('FOUND', resolvedSpec, foundEntrypoint);
+          if (!foundEntrypoint) {
+            return spec;
+          }
+          spec = foundEntrypoint[0];
+        }
+        return await this.resolvePackageImport(entrypoint, spec, config);
       },
     );
     return installedPackageCode;
@@ -216,6 +198,7 @@ export default {
   },
 
   async prepare(commandOptions: CommandOptions) {
+    console.time('SYNC');
     config = commandOptions.config;
     const installDirectoryHashLoc = path.join(DEV_DEPENDENCIES_DIR, '.meta');
     const installDirectoryHash = await fs
@@ -241,12 +224,13 @@ export default {
       return;
     }
     await Promise.all(
-      [...new Set(installTargets.map((t) => t.specifier))].map((spec) =>
-        this.resolvePackageImport(path.join(config.root, 'package.json'), spec, config),
-      ),
+      [...new Set(installTargets.map((t) => t.specifier))].map((spec) => {
+        return this.resolvePackageImport(path.join(config.root, 'package.json'), spec, config);
+      }),
     );
     await fs.writeFile(installDirectoryHashLoc, 'v1', 'utf-8');
     logger.info('Set up complete!');
+    console.timeEnd('SYNC');
     return;
   },
 
@@ -260,43 +244,56 @@ export default {
     const packageManifestLoc = path.join(rootPackageDirectory, 'package.json');
     const packageManifestStr = await fs.readFile(packageManifestLoc, 'utf8');
     const packageManifest = JSON.parse(packageManifestStr);
-    const newIntegrityHash = etag(packageManifestStr);
+    // const newIntegrityHash = etag(packageManifestStr);
     const {name: packageName, version: packageVersion} = packageManifest;
-    const installDest = path.join(
-      DEV_DEPENDENCIES_DIR,
-      packageManifest.name + '@' + packageManifest.version,
-    );
+    const installDest = path.join(DEV_DEPENDENCIES_DIR, packageName + '@' + packageVersion);
 
-    const [isNew, newImportMap] = await inProgress.add(async () => {
-      const existingImportMap =
-        (await fs.stat(installDest).catch(() => null)) &&
-        JSON.parse((await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'))!);
-      const existingIntegrityHash = await fs
-        .readFile(path.join(installDest, '.meta'), 'utf-8')
-        .catch(() => null);
-      const doesInstalledPackageExist = !!existingImportMap;
-      const isInstalledPackageStale =
-        !doesInstalledPackageExist || newIntegrityHash !== existingIntegrityHash;
-      const existingEntrypoint = existingImportMap && existingImportMap.imports[spec];
-      console.log(existingEntrypoint, !doesInstalledPackageExist, isInstalledPackageStale);
-      if (!isInstalledPackageStale && existingEntrypoint) {
-        return [false, existingImportMap];
-      }
-      return [
-        true,
-        await installPackageEntrypoint({
+    let isNew = !allKnownSpecs.has(spec);
+    allKnownSpecs.add(spec);
+    const newImportMap = await inProgress.add(
+      async (): Promise<ImportMap> => {
+        // If an install is already in progress, wait for that to finish and check that result first.
+        // We use a "while" here because many requests to the same package may get backed up here while
+        // waiting. If they all fail to match the original on completion, the while loop ensures that
+        // only one will
+        while (inProgressRunning.has(installDest)) {
+          console.log(spec, 'CACHED! (already running)');
+          const newImportMap = await inProgressRunning.get(installDest);
+          if (newImportMap?.imports[spec]) {
+            return newImportMap;
+          }
+        }
+
+        // Note(fks): The rest of this function must by synchronous, to make sure that multiple builds don't
+        // kick off at once. If a build breaks out of the while loop, it must be a straight, syncronous
+        // shot to the step below where it re-adds a job to the inProgressRunning map.
+        // TODO(fks): There's probably a smarter way to organize this that removes the sync requirement.
+
+        // Look up the import map of the installed package, and check if this specifier now exists.
+        const existingImportMapLoc = path.join(installDest, 'import-map.json');
+        const existingImportMap =
+          existsSync(existingImportMapLoc) &&
+          JSON.parse(readFileSync(existingImportMapLoc, 'utf8')!);
+        if (existingImportMap && existingImportMap.imports[spec]) {
+          console.log(spec, 'CACHED! (already exists)');
+          return existingImportMap;
+        }
+        // Otherwise, kick off a new build!
+        console.log(`Installing ${spec}...`);
+        const installPackagePromise = installPackageEntrypoint({
           installDest,
-          spec,
           packageManifest,
           packageManifestLoc,
-          importMap: existingImportMap,
-        }),
-      ];
-    });
-    await fs.writeFile(path.join(installDest, '.meta'), newIntegrityHash, 'utf8');
-    await inProgress.onIdle();
-    const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
+        });
+        inProgressRunning.set(installDest, installPackagePromise);
+        const newImportMap = await installPackagePromise;
+        console.log(`Installing ${spec}... DONE`);
+        inProgressRunning.delete(installDest);
+        return newImportMap;
+      },
+    );
 
+    const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
     if (isNew) {
       let installedPackageCode = await fs.readFile(dependencyFileLoc!, 'utf8');
       const packageImports = new Set<string>();
@@ -310,20 +307,24 @@ export default {
         }
         packageImports.add(spec);
       }
-      console.log(packageImports);
       await Promise.all(
         [...packageImports].map((packageImport) =>
           this.resolvePackageImport(entrypoint, packageImport, config),
         ),
       );
-      await inProgress.onIdle();
     }
 
     const flattedSpec = newImportMap.imports[spec]
-      .replace(/\//g, '.')
-      .replace(/^\.+/g, '')
-      .replace(/\.([^\.]*?)$/, `.v${packageVersion}.$1`);
-      allHashes[flattedSpec] = {packageName, packageVersion, entrypoint, loc: dependencyFileLoc};
+    .replace(/\//g, '.')
+    .replace(/^\.+/g, '')
+    .replace(/\.([^\.]*?)$/, `.v${packageVersion}.$1`);
+    console.log(spec, '->', flattedSpec);
+    allHashes[flattedSpec] = {
+      entrypoint,
+      loc: dependencyFileLoc,
+      installDest,
+      packageVersion,
+    };
     return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', `-`, flattedSpec);
   },
 

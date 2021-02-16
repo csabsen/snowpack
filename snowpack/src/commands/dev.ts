@@ -15,24 +15,11 @@ import stream from 'stream';
 import url from 'url';
 import util from 'util';
 import zlib from 'zlib';
-import {
-  generateEnvModule,
-  getMetaUrlPath,
-  wrapHtmlResponse,
-  wrapImportMeta,
-  wrapImportProxy,
-} from '../build/build-import-proxy';
-import {buildFile} from '../build/build-pipeline';
+import {generateEnvModule, getMetaUrlPath} from '../build/build-import-proxy';
+import {FileBuilder} from '../build/file-builder';
 import {getMountEntryForFile, getUrlsForFile} from '../build/file-urls';
-import {createImportResolver} from '../build/import-resolver';
 import {EsmHmrEngine} from '../hmr-server-engine';
 import {logger} from '../logger';
-import {
-  scanCodeImportsExports,
-  transformEsmImports,
-  transformFileImports,
-} from '../rewrite-imports';
-import {matchDynamicImportValue} from '../scan-imports';
 import {getPackageSource} from '../sources/util';
 import {createLoader as createServerRuntime} from '../ssr-loader';
 import {
@@ -41,21 +28,9 @@ import {
   OnFileChangeCallback,
   RouteConfigObject,
   ServerRuntime,
-  SnowpackBuildMap,
-  SnowpackBuiltFile,
-  SnowpackConfig,
   SnowpackDevServer,
-  SnowpackSourceFile,
 } from '../types';
-import {
-  hasExtension,
-  HMR_CLIENT_CODE,
-  HMR_OVERLAY_CODE,
-  isRemoteUrl,
-  openInBrowser,
-  relativeURL,
-  replaceExtension,
-} from '../util';
+import {hasExtension, HMR_CLIENT_CODE, HMR_OVERLAY_CODE, openInBrowser} from '../util';
 import {getPort, getServerInfoMessage, paintDashboard, paintEvent} from './paint';
 
 class OneToManyMap {
@@ -385,247 +360,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
   }
 
-  class FileBuilder {
-    output: SnowpackBuildMap = {};
-    filesToResolve: Record<string, SnowpackSourceFile> = {};
-    filesToProxy: string[] = [];
-    isHMR: boolean;
-    isSSR: boolean;
-    isStatic: boolean;
-    isResolve: boolean;
-    buildPromise: Promise<SnowpackBuildMap> | undefined;
-
-    readonly loc: string;
-    // readonly mountEntry: MountEntry;
-    // readonly outDir: string;
-    readonly config: SnowpackConfig;
-
-    constructor({
-      loc,
-      isHMR,
-      isSSR,
-      isStatic,
-      isResolve,
-      // mountEntry,
-      // outDir,
-      config,
-    }: {
-      loc: string;
-      isHMR: boolean;
-      isSSR: boolean;
-      isStatic: boolean;
-      isResolve: boolean;
-      // mountEntry: MountEntry;
-      // outDir: string;
-      config: SnowpackConfig;
-    }) {
-      this.loc = loc;
-      this.isHMR = isHMR;
-      this.isSSR = isSSR;
-      this.isStatic = isStatic;
-      this.isResolve = isResolve;
-      // this.mountEntry = mountEntry;
-      // this.outDir = outDir;
-      this.config = config;
-    }
-
-    private verifyRequestFromBuild(type: string): SnowpackBuiltFile {
-      // Verify that the requested file exists in the build output map.
-      if (!this.output[type] || !Object.keys(this.output)) {
-        throw new Error(`Requested content "${type}" but built ${Object.keys(this.output)}`);
-      }
-      return this.output[type];
-    }
-
-    /**
-     * Resolve Imports: Resolved imports are based on the state of the file
-     * system, so they can't be cached long-term with the build.
-     */
-    private async resolveImports({
-      contents: _contents,
-      type,
-      url,
-      reqUrlHmrParam,
-    }: {
-      contents: string | Buffer;
-      type: string;
-      url: string;
-      reqUrlHmrParam: string | false;
-    }): Promise<string | Buffer> {
-      if (typeof _contents !== 'string') {
-        return _contents;
-      }
-      let contents = _contents;
-      const resolveImportSpecifier = createImportResolver({
-        fileLoc: this.loc,
-        config,
-      });
-      contents = await transformFileImports({type, contents}, async (spec) => {
-        // Try to resolve the specifier to a known URL in the project
-        let resolvedImportUrl = resolveImportSpecifier(spec);
-        // Handle a package import
-        if (!resolvedImportUrl) {
-          resolvedImportUrl = await pkgSource.resolvePackageImport(this.loc, spec, config);
-        }
-        // Handle a package import that couldn't be resolved
-        if (!resolvedImportUrl) {
-          return spec;
-        }
-        // Ignore "http://*" imports
-        if (isRemoteUrl(resolvedImportUrl)) {
-          return resolvedImportUrl;
-        }
-        // Ignore packages marked as external
-        if (config.packageOptions.external?.includes(resolvedImportUrl)) {
-          return spec;
-        }
-        // Handle normal "./" & "../" import specifiers
-        const importExtName = path.posix.extname(resolvedImportUrl);
-        const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs';
-        const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
-        if (isProxyImport) {
-          resolvedImportUrl = resolvedImportUrl + '.proxy.js';
-        }
-
-        // When dealing with an absolute import path, we need to honor the baseUrl
-        // proxy modules may attach code to the root HTML (like style) so don't resolve
-        if (isAbsoluteUrlPath /* && !isProxyModule */) {
-          resolvedImportUrl = relativeURL(path.posix.dirname(url), resolvedImportUrl);
-        }
-        // Make sure that a relative URL always starts with "./"
-        if (!resolvedImportUrl.startsWith('.') && !resolvedImportUrl.startsWith('/')) {
-          resolvedImportUrl = './' + resolvedImportUrl;
-        }
-        return resolvedImportUrl;
-      });
-
-      if (type === '.js' && reqUrlHmrParam)
-        contents = await transformEsmImports(contents as string, (imp) => {
-          const importUrl = path.posix.resolve(path.posix.dirname(url), imp);
-          const node = hmrEngine.getEntry(importUrl);
-          if (node && node.needsReplacement) {
-            hmrEngine.markEntryForReplacement(node, false);
-            return `${imp}?${reqUrlHmrParam}`;
-          }
-          return imp;
-        });
-
-      if (type === '.js') {
-        const isHmrEnabled = contents.includes('import.meta.hot');
-        const rawImports = await scanCodeImportsExports(contents);
-        const resolvedImports = rawImports.map((imp) => {
-          let spec = contents.substring(imp.s, imp.e);
-          if (imp.d > -1) {
-            spec = matchDynamicImportValue(spec) || '';
-          }
-          spec = spec.replace(/\?mtime=[0-9]+$/, '');
-          return path.posix.resolve(path.posix.dirname(url), spec);
-        });
-        hmrEngine.setEntry(url, resolvedImports, isHmrEnabled);
-      }
-
-      return contents;
-    }
-
-    /**
-     * Given a file, build it. Building a file sends it through our internal
-     * file builder pipeline, and outputs a build map representing the final
-     * build. A Build Map is used because one source file can result in multiple
-     * built files (Example: .svelte -> .js & .css).
-     */
-    async build() {
-      if (this.buildPromise) {
-        return this.buildPromise;
-      }
-      const fileBuilderPromise = (async () => {
-        const builtFileOutput = await buildFile(url.pathToFileURL(this.loc), {
-          config: this.config,
-          isDev: true,
-          isSSR: this.isSSR,
-          isHmrEnabled: this.isHMR,
-        });
-        return builtFileOutput;
-      })();
-      this.buildPromise = fileBuilderPromise;
-      try {
-        messageBus.emit(paintEvent.BUILD_FILE, {id: this.loc, isBuilding: true});
-        this.output = await fileBuilderPromise;
-      } finally {
-        this.buildPromise = undefined;
-        messageBus.emit(paintEvent.BUILD_FILE, {id: this.loc, isBuilding: false});
-      }
-    }
-
-    async getResult(
-      url: string,
-      type: string,
-      reqUrlHmrParam: string | false,
-    ): Promise<string | Buffer> {
-      const {code /*, map */} = this.verifyRequestFromBuild(type);
-      let finalResponse = code;
-      // Handle attached CSS.
-      if (type === '.js' && this.output['.css']) {
-        finalResponse = `import '${replaceExtension(url, '.js', '.css')}';\n` + finalResponse;
-      }
-      // Resolve imports.
-      if (this.loc && (type === '.js' || type === '.html' || type === '.css')) {
-        finalResponse = await this.resolveImports({
-          url,
-          type,
-          contents: finalResponse,
-          reqUrlHmrParam,
-        });
-      }
-      // Wrap the response.
-      switch (type) {
-        case '.html': {
-          finalResponse = wrapHtmlResponse({
-            code: finalResponse as string,
-            hmr: this.isHMR,
-            hmrPort: hmrEngine.port !== port ? hmrEngine.port : undefined,
-            isDev: true,
-            config,
-            mode: 'development',
-          });
-          break;
-        }
-        case '.css': {
-          // if (sourceMap) code = cssSourceMappingURL(code as string, sourceMappingURL);
-          break;
-        }
-        case '.js':
-          {
-            // if (isProxyModule) {
-            //   code = await wrapImportProxy({url: reqPath, code, hmr: isHMR, config});
-            // } else {
-            finalResponse = wrapImportMeta({
-              code: finalResponse as string,
-              env: true,
-              hmr: this.isHMR,
-              config,
-            });
-          }
-
-          // source mapping
-          // if (sourceMap) code = jsSourceMappingURL(code, sourceMappingURL);
-
-          break;
-      }
-
-      // Return the finalized response.
-      return finalResponse;
-    }
-
-    async getSourceMap(type: string): Promise<string | undefined> {
-      return this.output[type].map;
-    }
-    async getProxy(url: string, type: string) {
-      const code = this.output[type].code;
-      // TODO: support css modules
-      return await wrapImportProxy({url, code, hmr: this.isHMR, config});
-    }
-  }
-
   function loadUrl(
     reqUrl: string,
     {
@@ -669,7 +403,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     const encoding = _encoding ?? null;
     const reqUrlHmrParam = reqUrl.includes('?mtime=') && reqUrl.split('?')[1];
     const reqPath = decodeURI(url.parse(reqUrl).pathname!);
-    const resourcePath = reqUrl.replace(/\.map$/, '').replace(/\.proxy\.js$/, '');
+    const resourcePath = reqPath.replace(/\.map$/, '').replace(/\.proxy\.js$/, '');
     const resourceType = path.extname(resourcePath) || '.html';
 
     if (reqPath === getMetaUrlPath('/hmr-client.js', config)) {
@@ -741,7 +475,15 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     let fileBuilder: FileBuilder | undefined = inMemoryBuildCache.get(cacheKey);
 
     if (!fileBuilder) {
-      fileBuilder = new FileBuilder({loc: fileLoc, isSSR, isHMR, config, isStatic, isResolve});
+      fileBuilder = new FileBuilder({
+        loc: fileLoc,
+        isSSR,
+        isHMR,
+        config,
+        isStatic,
+        isResolve,
+        hmrEngine,
+      });
       inMemoryBuildCache.set(cacheKey, fileBuilder);
       await fileBuilder.build();
     }
@@ -758,12 +500,12 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
 
     let finalizedResponse: string | Buffer;
-    if (reqUrl.endsWith('.proxy.js')) {
+    if (reqPath.endsWith('.proxy.js')) {
       finalizedResponse = await fileBuilder.getProxy(resourcePath, resourceType).catch((err) => {
         handleFinalizeError(err);
         throw err;
       });
-    } else if (reqUrl.endsWith('.proxy.js')) {
+    } else if (reqPath.endsWith('.map')) {
       const _finalizedResponse = await fileBuilder.getSourceMap(resourcePath).catch((err) => {
         handleFinalizeError(err);
         throw err;
@@ -773,12 +515,17 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       }
       finalizedResponse = _finalizedResponse;
     } else {
-      finalizedResponse = await fileBuilder
-        .getResult(reqPath, resourceType, reqUrlHmrParam)
-        .catch((err) => {
-          handleFinalizeError(err);
-          throw err;
-        });
+      try {
+        const buildResult = await fileBuilder.getResult(resourceType);
+        finalizedResponse = await fileBuilder.resolveImports(
+          resourceType,
+          buildResult,
+          reqUrlHmrParam,
+        );
+      } catch (err) {
+        handleFinalizeError(err);
+        throw err;
+      }
     }
 
     return {
@@ -918,6 +665,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       hmrEngine.broadcastMessage({type: 'update', url, bubbled: isBubbled});
     }
     visited.add(url);
+    console.log('CHECK', url, node && node.dependents);
     if (node && node.isHmrAccepted) {
       // Found a boundary, no bubbling needed
     } else if (node && node.dependents.size > 0) {
@@ -954,8 +702,11 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     // actually exist on disk, so we need the main resource (the JS) to load
     // first. Only after that happens will the CSS exist.
     const virtualCssFileUrl = updatedUrl.replace(/.js$/, '.css');
-    const virtualNode = hmrEngine.getEntry(`${virtualCssFileUrl}.proxy.js`);
+    const virtualNode =
+      virtualCssFileUrl.includes(path.basename(fileLoc)) &&
+      hmrEngine.getEntry(`${virtualCssFileUrl}.proxy.js`);
     if (virtualNode) {
+      console.log('REPLACE', virtualNode);
       hmrEngine.markEntryForReplacement(virtualNode, true);
     }
 

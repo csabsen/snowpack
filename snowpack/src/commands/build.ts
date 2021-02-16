@@ -47,6 +47,7 @@ import {
 } from '../util';
 import {run as installRunner} from '../sources/local-install';
 import {getPackageSource} from '../sources/util';
+import {FileBuilder} from '../build/file-builder';
 
 const CONCURRENT_WORKERS = require('os').cpus().length;
 
@@ -56,21 +57,8 @@ function getIsHmrEnabled(config: SnowpackConfig) {
 }
 
 function handleFileError(err: Error, builder: FileBuilder) {
-  logger.error(`✘ ${builder.fileURL}`);
+  logger.error(`✘ ${builder.loc}`);
   throw err;
-}
-
-function createBuildFileManifest(allFiles: FileBuilder[]): SnowpackBuildResultFileManifest {
-  const result: SnowpackBuildResultFileManifest = {};
-  for (const sourceFile of allFiles) {
-    for (const outputFile of Object.entries(sourceFile.output)) {
-      result[outputFile[0]] = {
-        source: url.fileURLToPath(sourceFile.fileURL),
-        contents: outputFile[1],
-      };
-    }
-  }
-  return result;
 }
 
 /**
@@ -129,245 +117,6 @@ async function installOptimizedDependencies(
     shouldPrintStats: false,
   });
   return installResult;
-}
-
-/**
- * FileBuilder - This class is responsible for building a file. It is broken into
- * individual stages so that the entire application build process can be tackled
- * in stages (build -> resolve -> write to disk).
- */
-export class FileBuilder {
-  output: Record<string, string | Buffer> = {};
-  filesToResolve: Record<string, SnowpackSourceFile> = {};
-  filesToProxy: string[] = [];
-
-  readonly fileURL: URL;
-  readonly mountEntry: MountEntry;
-  readonly outDir: string;
-  readonly config: SnowpackConfig;
-
-  constructor({
-    fileURL,
-    mountEntry,
-    outDir,
-    config,
-  }: {
-    fileURL: URL;
-    mountEntry: MountEntry;
-    outDir: string;
-    config: SnowpackConfig;
-  }) {
-    this.fileURL = fileURL;
-    this.mountEntry = mountEntry;
-    this.outDir = outDir;
-    this.config = config;
-  }
-
-  async buildFile() {
-    this.filesToResolve = {};
-    const isSSR = this.config.buildOptions.ssr;
-    const srcExt = path.extname(url.fileURLToPath(this.fileURL));
-    const fileOutput = this.mountEntry.static
-      ? {[srcExt]: {code: await readFile(this.fileURL)}}
-      : await buildFile(this.fileURL, {
-          config: this.config,
-          isDev: false,
-          isSSR,
-          isHmrEnabled: false,
-        });
-
-    for (const [fileExt, buildResult] of Object.entries(fileOutput)) {
-      let {code, map} = buildResult;
-      if (!code) {
-        continue;
-      }
-      let outFilename = path.basename(url.fileURLToPath(this.fileURL));
-      const extensionMatch = getExtensionMatch(this.fileURL.toString(), this.config._extensionMap);
-      if (extensionMatch) {
-        const [inputExt, outputExts] = extensionMatch;
-        if (outputExts.length > 1) {
-          outFilename = addExtension(path.basename(url.fileURLToPath(this.fileURL)), fileExt);
-        } else {
-          outFilename = replaceExtension(
-            path.basename(url.fileURLToPath(this.fileURL)),
-            inputExt,
-            fileExt,
-          );
-        }
-      }
-      const outLoc = path.join(this.outDir, outFilename);
-      const sourceMappingURL = outFilename + '.map';
-      if (this.mountEntry.resolve && typeof code === 'string') {
-        switch (fileExt) {
-          case '.css': {
-            if (map) code = cssSourceMappingURL(code, sourceMappingURL);
-            this.filesToResolve[outLoc] = {
-              baseExt: fileExt,
-              root: this.config.root,
-              contents: code,
-              locOnDisk: url.fileURLToPath(this.fileURL),
-            };
-            break;
-          }
-
-          case '.js': {
-            if (fileOutput['.css']) {
-              // inject CSS if imported directly
-              code = `import './${replaceExtension(outFilename, '.js', '.css')}';\n` + code;
-            }
-            code = wrapImportMeta({code, env: true, hmr: false, config: this.config});
-            if (map) code = jsSourceMappingURL(code, sourceMappingURL);
-            this.filesToResolve[outLoc] = {
-              baseExt: fileExt,
-              root: this.config.root,
-              contents: code,
-              locOnDisk: url.fileURLToPath(this.fileURL),
-            };
-            break;
-          }
-
-          case '.html': {
-            code = wrapHtmlResponse({
-              code,
-              hmr: getIsHmrEnabled(this.config),
-              hmrPort: hmrEngine ? hmrEngine.port : undefined,
-              isDev: false,
-              config: this.config,
-              mode: 'production',
-            });
-            this.filesToResolve[outLoc] = {
-              baseExt: fileExt,
-              root: this.config.root,
-              contents: code,
-              locOnDisk: url.fileURLToPath(this.fileURL),
-            };
-            break;
-          }
-        }
-      }
-
-      this.output[outLoc] = code;
-      if (map) {
-        this.output[path.join(this.outDir, sourceMappingURL)] = map;
-      }
-    }
-  }
-
-  async resolveImports(importMap: ImportMap) {
-    let isSuccess = true;
-    this.filesToProxy = [];
-    for (const [outLoc, rawFile] of Object.entries(this.filesToResolve)) {
-      // don’t transform binary file contents
-      if (Buffer.isBuffer(rawFile.contents)) {
-        continue;
-      }
-      const file = rawFile as SnowpackSourceFile<string>;
-      const resolveImportSpecifier = createImportResolver({
-        fileLoc: file.locOnDisk!, // we’re confident these are reading from disk because we just read them
-        config: this.config,
-      });
-      const resolvedCode = await transformFileImports(
-        {type: file.baseExt, contents: file.contents},
-        (spec) => {
-          // Try to resolve the specifier to a known URL in the project
-          let resolvedImportUrl = resolveImportSpecifier(spec);
-          // If not resolved, then this is a package. During build, dependencies are always
-          // installed locally via esinstall, so use localPackageSource here.
-          if (!resolvedImportUrl && importMap.imports[spec]) {
-            const importMapEntry = importMap.imports[spec];
-            resolvedImportUrl = path.posix.join(
-              this.config.buildOptions.metaUrlPath,
-              'pkg',
-              importMapEntry,
-            );
-          }
-          // If still not resolved, then this imported package somehow evaded detection
-          // when we scanned it in the previous step. If you find a bug here, report it!
-          if (!resolvedImportUrl) {
-            isSuccess = false;
-            logger.error(`${file.locOnDisk} - Could not resolve unknown import "${spec}".`);
-            return spec;
-          }
-          // Ignore "http://*" imports
-          if (isRemoteUrl(resolvedImportUrl)) {
-            return resolvedImportUrl;
-          }
-          // Ignore packages marked as external
-          if (this.config.packageOptions.external?.includes(resolvedImportUrl)) {
-            return resolvedImportUrl;
-          }
-          // Handle normal "./" & "../" import specifiers
-          const importExtName = path.extname(resolvedImportUrl);
-          const isBundling = !!this.config.optimize?.bundle;
-          const isProxyImport =
-            importExtName &&
-            importExtName !== '.js' &&
-            !path.posix.isAbsolute(spec) &&
-            // If using our built-in bundler, treat CSS as a first class citizen (no proxy file needed).
-            // TODO: Remove special `.module.css` handling by building css modules to native JS + CSS.
-            (!isBundling || !/(?<!module)\.css$/.test(resolvedImportUrl));
-          const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
-          let resolvedImportPath = removeLeadingSlash(path.normalize(resolvedImportUrl));
-          // We treat ".proxy.js" files special: we need to make sure that they exist on disk
-          // in the final build, so we mark them to be written to disk at the next step.
-          if (isProxyImport) {
-            if (isAbsoluteUrlPath) {
-              this.filesToProxy.push(
-                path.resolve(this.config.buildOptions.out, resolvedImportPath),
-              );
-            } else {
-              this.filesToProxy.push(path.resolve(path.dirname(outLoc), resolvedImportPath));
-            }
-
-            resolvedImportPath = resolvedImportPath + '.proxy.js';
-            resolvedImportUrl = resolvedImportUrl + '.proxy.js';
-          }
-
-          // When dealing with an absolute import path, we need to honor the baseUrl
-          if (isAbsoluteUrlPath) {
-            resolvedImportUrl = relativeURL(
-              path.dirname(outLoc),
-              path.resolve(this.config.buildOptions.out, resolvedImportPath),
-            );
-          }
-          // Make sure that a relative URL always starts with "./"
-          if (!resolvedImportUrl.startsWith('.') && !resolvedImportUrl.startsWith('/')) {
-            resolvedImportUrl = './' + resolvedImportUrl;
-          }
-          return resolvedImportUrl;
-        },
-      );
-      this.output[outLoc] = resolvedCode;
-    }
-    return isSuccess;
-  }
-
-  async writeToDisk() {
-    mkdirp.sync(this.outDir);
-    for (const [outLoc, code] of Object.entries(this.output)) {
-      const encoding = typeof code === 'string' ? 'utf8' : undefined;
-      await fs.writeFile(outLoc, code, encoding);
-    }
-  }
-
-  async getProxy(originalFileLoc: string) {
-    const proxiedCode = this.output[originalFileLoc];
-    const proxiedUrl = originalFileLoc
-      .substr(this.config.buildOptions.out.length)
-      .replace(/\\/g, '/');
-    return wrapImportProxy({
-      url: proxiedUrl,
-      code: proxiedCode,
-      hmr: false,
-      config: this.config,
-    });
-  }
-
-  async writeProxyToDisk(originalFileLoc: string) {
-    const proxyCode = await this.getProxy(originalFileLoc);
-    const importProxyFileLoc = originalFileLoc + '.proxy.js';
-    await fs.writeFile(importProxyFileLoc, proxyCode, 'utf8');
-  }
 }
 
 export async function build(commandOptions: CommandOptions): Promise<SnowpackBuildResult> {
@@ -440,10 +189,7 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   const buildPipelineFiles: Record<string, FileBuilder> = {};
 
   /** Install all needed dependencies, based on the master buildPipelineFiles list.  */
-  async function installDependencies() {
-    const scannedFiles = Object.values(buildPipelineFiles)
-      .map((f) => Object.values(f.filesToResolve))
-      .reduce((flat, item) => flat.concat(item), []);
+  async function installDependencies(scannedFiles: SnowpackSourceFile[]) {
     const installDest = path.join(buildDirectoryLoc, config.buildOptions.metaUrlPath, 'pkg');
     const installResult = await installOptimizedDependencies(
       scannedFiles,
@@ -505,12 +251,21 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
         throw new Error(errorMessage);
       }
 
-      const outDir = path.dirname(finalDestLoc);
+      // const outDir = path.dirname(finalDestLoc);
+      // const buildPipelineFile = new FileBuilder({
+      //   fileURL: url.pathToFileURL(fileLoc),
+      //   mountEntry,
+      //   outDir,
+      //   config,
+      // });
       const buildPipelineFile = new FileBuilder({
-        fileURL: url.pathToFileURL(fileLoc),
-        mountEntry,
-        outDir,
+        loc: fileLoc,
+        isSSR,
+        isHMR: getIsHmrEnabled(config),
         config,
+        isStatic: mountEntry.static,
+        isResolve: mountEntry.resolve,
+        hmrEngine: hmrEngine,
       });
       buildPipelineFiles[fileLoc] = buildPipelineFile;
 
@@ -521,10 +276,16 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   // 1. Build all files for the first time, from source.
   const parallelWorkQueue = new PQueue({concurrency: CONCURRENT_WORKERS});
   const allBuildPipelineFiles = Object.values(buildPipelineFiles);
+  const buildResultManifest: SnowpackBuildResultFileManifest = {};
   for (const buildPipelineFile of allBuildPipelineFiles) {
-    parallelWorkQueue.add(() =>
-      buildPipelineFile.buildFile().catch((err) => handleFileError(err, buildPipelineFile)),
-    );
+    parallelWorkQueue.add(async () => {
+      await buildPipelineFile.build();
+      const buildResults = await buildPipelineFile.getAllResults(); //.catch((err) => handleFileError(err, buildPipelineFile)));
+      for (const [buildUrl, buildResult] of Object.entries(buildResults)) {
+        buildResultManifest[buildUrl] = {contents: buildResult, source: buildPipelineFile.loc};
+      }
+      // buildResultManifest = {...buildResultManifest, ...
+    });
   }
   await parallelWorkQueue.onIdle();
 
@@ -536,18 +297,34 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   );
 
   // 2. Install all dependencies. This gets us the import map we need to resolve imports.
-  let installResult = await installDependencies();
+  const allBuiltFiles = Object.entries(buildResultManifest).map(([k, v]) => {
+    return {
+      baseExt: path.extname(k),
+      root: config.root,
+      contents: v.contents,
+      locOnDisk: path.join(buildDirectoryLoc, k),
+    };
+  });
+
+  let installResult = await installDependencies(allBuiltFiles);
 
   logger.info(colors.yellow('! verifying build...'));
 
   // 3. Resolve all built file imports.
   const verifyStart = performance.now();
   for (const buildPipelineFile of allBuildPipelineFiles) {
-    parallelWorkQueue.add(() =>
-      buildPipelineFile
-        .resolveImports(installResult.importMap!)
-        .catch((err) => handleFileError(err, buildPipelineFile)),
-    );
+    parallelWorkQueue.add(async () => {
+      for (const buildUrl of buildPipelineFile.urls) {
+        console.log(buildUrl, buildResultManifest[buildUrl].contents);
+        buildResultManifest[buildUrl].contents = await buildPipelineFile.resolveImports(
+          path.extname(buildUrl),
+          buildResultManifest[buildUrl].contents,
+          false,
+          installResult.importMap!,
+        );
+        // .catch((err) => handleFileError(err, buildPipelineFile)),
+      }
+    });
   }
   await parallelWorkQueue.onIdle();
   const verifyEnd = performance.now();
@@ -560,23 +337,27 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   // 4. Write files to disk.
   logger.info(colors.yellow('! writing build to disk...'));
   const allImportProxyFiles = new Set(
-    allBuildPipelineFiles.map((b) => b.filesToProxy).reduce((flat, item) => flat.concat(item), []),
-  );
+    allBuildPipelineFiles.map((b) => b.proxyImports).reduce((flat, item) => flat.concat(item), []),
+    );
+    console.log(allImportProxyFiles);
   for (const buildPipelineFile of allBuildPipelineFiles) {
-    parallelWorkQueue.add(() => buildPipelineFile.writeToDisk());
-    for (const builtFile of Object.keys(buildPipelineFile.output)) {
+    parallelWorkQueue.add(() =>
+      buildPipelineFile.writeToDisk(buildDirectoryLoc, buildResultManifest),
+    );
+    for (const builtFile of buildPipelineFile.urls) {
       if (allImportProxyFiles.has(builtFile)) {
-        parallelWorkQueue.add(() =>
-          buildPipelineFile
-            .writeProxyToDisk(builtFile)
-            .catch((err) => handleFileError(err, buildPipelineFile)),
+        parallelWorkQueue.add(async () => {
+          const result = await buildPipelineFile.getProxy(builtFile, path.extname(builtFile));
+          await mkdirp(path.dirname(path.join(buildDirectoryLoc, builtFile)));
+          return fs.writeFile(path.join(buildDirectoryLoc, builtFile + '.proxy.js'), result, 'utf8');
+          // .catch((err) => handleFileError(err, buildPipelineFile)),
+        }
         );
       }
     }
   }
   await parallelWorkQueue.onIdle();
 
-  const buildResultManifest = createBuildFileManifest(allBuildPipelineFiles);
   // TODO(fks): Add support for virtual files (injected by snowpack, plugins)
   // and web_modules in this manifest.
   // buildResultManifest[path.join(internalFilesBuildLoc, 'env.js')] = {

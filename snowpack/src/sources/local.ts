@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import {install as esinstall, resolveEntrypoint} from 'esinstall';
 import projectCacheDir from 'find-cache-dir';
-import {promises as fs} from 'fs';
+import {existsSync, promises as fs} from 'fs';
 import PQueue from 'p-queue';
 import path from 'path';
 import rimraf from 'rimraf';
@@ -36,17 +36,21 @@ function getRootPackageDirectory(loc: string) {
 }
 
 async function installPackage({
+  isSSR,
   installDest,
   packageManifest,
   packageManifestLoc,
 }: {
+  isSSR: boolean;
   installDest: string;
   packageManifest: any;
   packageManifestLoc: string;
-}): Promise<ImportMap> {
+}): Promise<{importMap: ImportMap, needsSsrBuild: boolean}> {
+  let needsSsrBuild = false;
   let installEntrypoints = [...allKnownSpecs].filter(
     (spec) => spec === packageManifest.name || spec.startsWith(packageManifest.name + '/'),
   );
+
   // TODO: external should be a function in esinstall
   const external = [
     ...Object.keys(packageManifest.dependencies || {}),
@@ -67,8 +71,6 @@ async function installPackage({
       warn: (...args: [any, ...any[]]) => logger.warn(util.format(...args)),
       error: (...args: [any, ...any[]]) => logger.error(util.format(...args)),
     },
-    packageExportLookupFields: ['svelte'],
-    packageLookupFields: ['svelte'],
     rollup: {
       plugins: [
         {
@@ -79,10 +81,11 @@ async function installPackage({
           // },
           async load(id: string) {
             // console.log('load()', id);
+            needsSsrBuild = needsSsrBuild || id.endsWith('.svelte');
             const output = await buildFile(url.pathToFileURL(id), {
               config,
               isDev: true,
-              isSSR: false,
+              isSSR,
               isHmrEnabled: false,
             });
             let jsResponse;
@@ -94,13 +97,16 @@ async function installPackage({
                 jsResponse = outputContents;
               }
             }
+            // TODO: Combine this with local-install.ts
+            // TODO: support CSS - add an import if needed?
             return jsResponse;
           },
         } as RollupPlugin,
       ],
     },
   });
-  return finalResult.importMap;
+
+  return {importMap: finalResult.importMap, needsSsrBuild};
 }
 
 // A bit of a hack: we keep this in local state and populate it
@@ -125,9 +131,14 @@ const inProgressBuilds = new PQueue({concurrency: 1});
  * interacts with esinstall and your locally installed dependencies.
  */
 export default {
-  async load(id: string): Promise<Buffer | string> {
+  async load(id: string, isSSR: boolean): Promise<Buffer | string> {
     const packageImport = allPackageImports[id];
-    const {loc, entrypoint, installDest, packageName, packageVersion} = packageImport;
+    const {loc, entrypoint, packageName, packageVersion} = packageImport;
+    let {installDest} = packageImport;
+    if (isSSR && existsSync(installDest + '-ssr')) {
+      installDest += '-ssr';
+    }
+
     // Wait for any in progress builds to complete, in case they've
     // cleared out the directory that you're trying to read out of.
     await inProgressBuilds.onIdle();
@@ -218,7 +229,11 @@ export default {
     }
     await Promise.all(
       [...new Set(installTargets.map((t) => t.specifier))].map((spec) => {
-        return this.resolvePackageImport(path.join(config.root, 'package.json'), spec, config);
+        return this.resolvePackageImport(
+          path.join(config.root, 'package.json'),
+          spec,
+          config,
+        );
       }),
     );
     await fs.writeFile(installDirectoryHashLoc, 'v1', 'utf-8');
@@ -256,12 +271,23 @@ export default {
         }
         // Otherwise, kick off a new build to generate a fresh import map.
         console.log(`Installing ${spec}...`);
-        const newImportMap = await installPackage({
+        const {importMap: newImportMap, needsSsrBuild} = await installPackage({
+          isSSR: false,
           installDest,
           packageManifest,
           packageManifestLoc,
         });
         console.log(`Installing ${spec}... DONE`, Object.keys(newImportMap.imports));
+        if (needsSsrBuild) {
+          console.log(`Installing ${spec} (ssr)...`);
+          await installPackage({
+            isSSR: true,
+            installDest: installDest + '-ssr',
+            packageManifest,
+            packageManifestLoc,
+          });
+          console.log(`Installing ${spec} (ssr)... DONE`);
+        }
         const dependencyFileLoc = path.join(installDest, newImportMap.imports[spec]);
         return [newImportMap, await fs.readFile(dependencyFileLoc!)];
       },

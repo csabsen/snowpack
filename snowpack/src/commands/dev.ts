@@ -429,7 +429,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
     if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
       const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
-      const loadedModule = await pkgSource.load(webModuleUrl, commandOptions);
+      const loadedModule = await pkgSource.load(webModuleUrl, isSSR, commandOptions);
       return {
         contents: encodeResponse(loadedModule, encoding),
         originalFileLoc: null,

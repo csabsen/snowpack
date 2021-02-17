@@ -360,6 +360,7 @@ export interface PackageSource {
    */
   load(
     spec: string,
+    isSSR: boolean,
     options: {config: SnowpackConfig; lockfile: LockfileManifest | null},
   ): Promise<Buffer | string>;
   /** Resolve a package import to URL (ex: "react" -> "/pkg/react") */

@@ -6,7 +6,6 @@ import {clearCache as clearSkypackCache, rollupPluginSkypack} from 'skypack';
 import util from 'util';
 import {logger} from '../logger';
 import {
-  ImportMap,
   LockfileManifest,
   PackageSource,
   PackageSourceRemote,
@@ -102,6 +101,7 @@ export default {
 
   async load(
     spec: string,
+    isSSR: boolean,
     {config, lockfile}: {config: SnowpackConfig; lockfile: LockfileManifest | null},
   ): Promise<string | Buffer> {
     let body: Buffer;

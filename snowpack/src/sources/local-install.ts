@@ -8,6 +8,8 @@ import {
 import * as colors from 'kleur/colors';
 import {performance} from 'perf_hooks';
 import util from 'util';
+import url from 'url';
+import {buildFile} from '../build/build-pipeline';
 import {logger} from '../logger';
 import {ImportMap, SnowpackConfig} from '../types';
 
@@ -53,6 +55,32 @@ export async function run({
       error: (...args: [any, ...any[]]) => logger.error(util.format(...args)),
     },
     ...installOptions,
+    rollup: {
+      plugins: [
+        {
+          name: 'esinstall:snowpack',
+          async load(id: string) {
+            console.log('load()', id);
+            const output = await buildFile(url.pathToFileURL(id), {
+              config,
+              isDev: true,
+              isSSR: config.buildOptions.ssr,
+              isHmrEnabled: false,
+            });
+            let jsResponse;
+            for (const [outputType, outputContents] of Object.entries(output)) {
+              if (jsResponse) {
+                console.log(`load() Err: ${Object.keys(output)}`);
+              }
+              if (!jsResponse || outputType === '.js') {
+                jsResponse = outputContents;
+              }
+            }
+            return jsResponse;
+          },
+        },
+      ],
+    },
   });
   logger.debug('Successfully ran esinstall.');
 

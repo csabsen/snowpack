@@ -1,7 +1,7 @@
+import {promises as fs} from 'fs';
 import mkdirp from 'mkdirp';
 import path from 'path';
 import url from 'url';
-import {promises as fs} from 'fs';
 import {EsmHmrEngine} from '../hmr-server-engine';
 import {
   scanCodeImportsExports,
@@ -11,20 +11,17 @@ import {
 import {matchDynamicImportValue} from '../scan-imports';
 import {getPackageSource} from '../sources/util';
 import {
-  MountEntry,
+  ImportMap,
   SnowpackBuildMap,
+  SnowpackBuildResultFileManifest,
   SnowpackBuiltFile,
   SnowpackConfig,
-  SnowpackSourceFile,
-  ImportMap,
-  SnowpackBuildResultFileManifest,
 } from '../types';
 import {isRemoteUrl, relativeURL, replaceExtension} from '../util';
 import {wrapHtmlResponse, wrapImportMeta, wrapImportProxy} from './build-import-proxy';
 import {buildFile} from './build-pipeline';
-import {getMountEntryForFile, getUrlsForFile} from './file-urls';
+import {getUrlsForFile} from './file-urls';
 import {createImportResolver} from './import-resolver';
-import {Console} from 'console';
 
 /**
  * FileBuilder - This class is responsible for building a file. It is broken into
@@ -33,7 +30,6 @@ import {Console} from 'console';
  */
 export class FileBuilder {
   output: SnowpackBuildMap = {};
-
   proxyImports: string[] = [];
 
   isHMR: boolean;
@@ -87,102 +83,113 @@ export class FileBuilder {
    * Resolve Imports: Resolved imports are based on the state of the file
    * system, so they can't be cached long-term with the build.
    */
-  async resolveImports(
-    type: string,
-    _contents: string | Buffer,
-    hmrParam?: string | false,
-    importMap?: ImportMap,
-  ): Promise<string | Buffer> {
+  async resolveImports(hmrParam?: string | false, importMap?: ImportMap): Promise<void> {
     const urlPathDirectory = path.posix.dirname(this.urls[0]!);
     const pkgSource = getPackageSource(this.config.packageOptions.source);
-    if (typeof _contents !== 'string') {
-      return _contents;
-    }
-    if (!(type === '.js' || type === '.html' || type === '.css')) {
-      return _contents;
-    }
-    let contents = _contents;
-    const resolveImportSpecifier = createImportResolver({
-      fileLoc: this.loc,
-      config: this.config,
-    });
-    contents = await transformFileImports({type, contents}, async (spec) => {
-      // Try to resolve the specifier to a known URL in the project
-      let resolvedImportUrl = resolveImportSpecifier(spec);
-      // Handle a package import
-      console.log(spec, importMap);
-      if (!resolvedImportUrl && importMap) {
-        if (importMap.imports[spec]) {
-          const PACKAGE_PATH_PREFIX = path.posix.join(this.config.buildOptions.metaUrlPath, 'pkg/');
-          return path.posix.join(PACKAGE_PATH_PREFIX, importMap.imports[spec]);
+    for (const [type, outputResult] of Object.entries(this.output)) {
+      console.log('OKAY', this.loc, type);
+      if (!(type === '.js' || type === '.html' || type === '.css')) {
+        continue;
+      }
+      let contents =
+        typeof outputResult.code === 'string'
+          ? outputResult.code
+          : outputResult.code.toString('utf8');
+
+      // Handle attached CSS.
+      if (type === '.js' && this.output['.css']) {
+        const relativeCssImport = `./${replaceExtension(
+          path.posix.basename(this.urls[0]!),
+          '.js',
+          '.css',
+        )}`;
+        contents = `import '${relativeCssImport}';\n` + contents;
+      }
+      const resolveImportSpecifier = createImportResolver({
+        fileLoc: this.loc,
+        config: this.config,
+      });
+      contents = await transformFileImports({type, contents}, async (spec) => {
+        // Try to resolve the specifier to a known URL in the project
+        let resolvedImportUrl = resolveImportSpecifier(spec);
+        // Handle a package import
+        console.log(spec, importMap);
+        if (!resolvedImportUrl && importMap) {
+          if (importMap.imports[spec]) {
+            const PACKAGE_PATH_PREFIX = path.posix.join(
+              this.config.buildOptions.metaUrlPath,
+              'pkg/',
+            );
+            return path.posix.join(PACKAGE_PATH_PREFIX, importMap.imports[spec]);
+          }
+          // TODO: Not getting reported during build?
+          throw new Error(`Unexpected: spec ${spec} not included in import map.`);
         }
-        // TODO: Not getting reported during build?
-        throw new Error(`Unexpected: spec ${spec} not included in import map.`);
-      }
-      if (!resolvedImportUrl) {
-        resolvedImportUrl = await pkgSource.resolvePackageImport(this.loc, spec, this.config);
-      }
-      // Handle a package import that couldn't be resolved
-      if (!resolvedImportUrl) {
-        return spec;
-      }
-      // Ignore "http://*" imports
-      if (isRemoteUrl(resolvedImportUrl)) {
+        if (!resolvedImportUrl) {
+          resolvedImportUrl = await pkgSource.resolvePackageImport(this.loc, spec, this.config);
+        }
+        // Handle a package import that couldn't be resolved
+        if (!resolvedImportUrl) {
+          return spec;
+        }
+        // Ignore "http://*" imports
+        if (isRemoteUrl(resolvedImportUrl)) {
+          return resolvedImportUrl;
+        }
+        // Ignore packages marked as external
+        if (this.config.packageOptions.external?.includes(resolvedImportUrl)) {
+          return spec;
+        }
+
+        // Handle normal "./" & "../" import specifiers
+        const importExtName = path.posix.extname(resolvedImportUrl);
+        const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs';
+        const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
+        if (isProxyImport) {
+          this.proxyImports.push(path.posix.resolve(urlPathDirectory, resolvedImportUrl));
+          resolvedImportUrl = resolvedImportUrl + '.proxy.js';
+        }
+
+        // When dealing with an absolute import path, we need to honor the baseUrl
+        // proxy modules may attach code to the root HTML (like style) so don't resolve
+        if (isAbsoluteUrlPath /* && !isProxyModule */) {
+          resolvedImportUrl = relativeURL(urlPathDirectory, resolvedImportUrl);
+        }
+        // Make sure that a relative URL always starts with "./"
+        if (!resolvedImportUrl.startsWith('.') && !resolvedImportUrl.startsWith('/')) {
+          resolvedImportUrl = './' + resolvedImportUrl;
+        }
         return resolvedImportUrl;
-      }
-      // Ignore packages marked as external
-      if (this.config.packageOptions.external?.includes(resolvedImportUrl)) {
-        return spec;
-      }
-
-      // Handle normal "./" & "../" import specifiers
-      const importExtName = path.posix.extname(resolvedImportUrl);
-      const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs';
-      const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
-      if (isProxyImport) {
-        this.proxyImports.push(path.posix.resolve(urlPathDirectory, resolvedImportUrl));
-        resolvedImportUrl = resolvedImportUrl + '.proxy.js';
-      }
-
-      // When dealing with an absolute import path, we need to honor the baseUrl
-      // proxy modules may attach code to the root HTML (like style) so don't resolve
-      if (isAbsoluteUrlPath /* && !isProxyModule */) {
-        resolvedImportUrl = relativeURL(urlPathDirectory, resolvedImportUrl);
-      }
-      // Make sure that a relative URL always starts with "./"
-      if (!resolvedImportUrl.startsWith('.') && !resolvedImportUrl.startsWith('/')) {
-        resolvedImportUrl = './' + resolvedImportUrl;
-      }
-      return resolvedImportUrl;
-    });
-
-    if (type === '.js' && hmrParam) {
-      contents = await transformEsmImports(contents as string, (imp) => {
-        const importUrl = path.posix.resolve(urlPathDirectory, imp);
-        const node = this.hmrEngine?.getEntry(importUrl);
-        if (node && node.needsReplacement) {
-          this.hmrEngine?.markEntryForReplacement(node, false);
-          return `${imp}?${hmrParam}`;
-        }
-        return imp;
       });
-    }
 
-    if (type === '.js') {
-      const isHmrEnabled = contents.includes('import.meta.hot');
-      const rawImports = await scanCodeImportsExports(contents);
-      const resolvedImports = rawImports.map((imp) => {
-        let spec = contents.substring(imp.s, imp.e);
-        if (imp.d > -1) {
-          spec = matchDynamicImportValue(spec) || '';
-        }
-        spec = spec.replace(/\?mtime=[0-9]+$/, '');
-        return path.posix.resolve(urlPathDirectory, spec);
-      });
-      this.hmrEngine?.setEntry(this.urls[0], resolvedImports, isHmrEnabled);
-    }
+      if (type === '.js' && hmrParam) {
+        contents = await transformEsmImports(contents as string, (imp) => {
+          const importUrl = path.posix.resolve(urlPathDirectory, imp);
+          const node = this.hmrEngine?.getEntry(importUrl);
+          if (node && node.needsReplacement) {
+            this.hmrEngine?.markEntryForReplacement(node, false);
+            return `${imp}?${hmrParam}`;
+          }
+          return imp;
+        });
+      }
 
-    return contents;
+      if (type === '.js') {
+        const isHmrEnabled = contents.includes('import.meta.hot');
+        const rawImports = await scanCodeImportsExports(contents);
+        const resolvedImports = rawImports.map((imp) => {
+          let spec = contents.substring(imp.s, imp.e);
+          if (imp.d > -1) {
+            spec = matchDynamicImportValue(spec) || '';
+          }
+          spec = spec.replace(/\?mtime=[0-9]+$/, '');
+          return path.posix.resolve(urlPathDirectory, spec);
+        });
+        this.hmrEngine?.setEntry(this.urls[0], resolvedImports, isHmrEnabled);
+      }
+      // Update the output with the new resolved imports
+      outputResult.code = contents;
+    }
   }
 
   /**
@@ -212,18 +219,9 @@ export class FileBuilder {
     }
   }
 
-  async getResult(type: string): Promise<string | Buffer> {
+  getResult(type: string): string | Buffer {
     const {code /*, map */} = this.verifyRequestFromBuild(type);
     let finalResponse = code;
-    // Handle attached CSS.
-    if (type === '.js' && this.output['.css']) {
-      const relativeCssImport = `./${replaceExtension(
-        path.posix.basename(this.urls[0]!),
-        '.js',
-        '.css',
-      )}`;
-      finalResponse = `import '${relativeCssImport}';\n` + finalResponse;
-    }
     // Wrap the response.
     switch (type) {
       case '.html': {
@@ -296,6 +294,8 @@ export class FileBuilder {
     // TODO: support css modules
     return await wrapImportProxy({url, code, hmr: this.isHMR, config: this.config});
   }
+
+  // TODO: Add a generic writeFileToDisk that handles mkdirp, etc.
 
   async writeToDisk(dir: string, results: SnowpackBuildResultFileManifest) {
     await mkdirp(path.dirname(path.join(dir, this.urls[0])));

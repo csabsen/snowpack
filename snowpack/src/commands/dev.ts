@@ -516,12 +516,8 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       finalizedResponse = _finalizedResponse;
     } else {
       try {
-        const buildResult = await fileBuilder.getResult(resourceType);
-        finalizedResponse = await fileBuilder.resolveImports(
-          resourceType,
-          buildResult,
-          reqUrlHmrParam,
-        );
+        await fileBuilder.resolveImports(reqUrlHmrParam);
+        finalizedResponse = await fileBuilder.getResult(resourceType);
       } catch (err) {
         handleFinalizeError(err);
         throw err;

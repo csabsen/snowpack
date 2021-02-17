@@ -1,5 +1,5 @@
 
-<Icon data={beer}/>
+<Icon data={refresh}/>
 
 <script>
   import Icon from 'svelte-awesome';

@@ -6,24 +6,18 @@ import PQueue from 'p-queue';
 import path from 'path';
 import {performance} from 'perf_hooks';
 import url from 'url';
-import {
-  generateEnvModule,
-  wrapHtmlResponse,
-  wrapImportMeta,
-  wrapImportProxy,
-} from '../build/build-import-proxy';
-import {buildFile, runPipelineCleanupStep, runPipelineOptimizeStep} from '../build/build-pipeline';
+import {generateEnvModule, wrapImportProxy} from '../build/build-import-proxy';
+import {runPipelineCleanupStep, runPipelineOptimizeStep} from '../build/build-pipeline';
+import {FileBuilder} from '../build/file-builder';
 import {getMountEntryForFile, getUrlsForFileMount} from '../build/file-urls';
-import {createImportResolver} from '../build/import-resolver';
 import {runBuiltInOptimize} from '../build/optimize';
 import {EsmHmrEngine} from '../hmr-server-engine';
 import {logger} from '../logger';
-import {transformFileImports} from '../rewrite-imports';
 import {getInstallTargets} from '../scan-imports';
+import {run as installRunner} from '../sources/local-install';
+import {getPackageSource} from '../sources/util';
 import {
   CommandOptions,
-  ImportMap,
-  MountEntry,
   OnFileChangeCallback,
   SnowpackBuildResult,
   SnowpackBuildResultFileManifest,
@@ -31,34 +25,18 @@ import {
   SnowpackSourceFile,
 } from '../types';
 import {
-  addExtension,
-  cssSourceMappingURL,
   deleteFromBuildSafe,
-  getExtensionMatch,
   HMR_CLIENT_CODE,
   HMR_OVERLAY_CODE,
   isFsEventsEnabled,
-  isRemoteUrl,
-  jsSourceMappingURL,
   readFile,
-  relativeURL,
-  removeLeadingSlash,
-  replaceExtension,
 } from '../util';
-import {run as installRunner} from '../sources/local-install';
-import {getPackageSource} from '../sources/util';
-import {FileBuilder} from '../build/file-builder';
 
 const CONCURRENT_WORKERS = require('os').cpus().length;
 
 let hmrEngine: EsmHmrEngine | null = null;
 function getIsHmrEnabled(config: SnowpackConfig) {
   return config.buildOptions.watch && !!config.devOptions.hmr;
-}
-
-function handleFileError(err: Error, builder: FileBuilder) {
-  logger.error(`✘ ${builder.loc}`);
-  throw err;
 }
 
 /**
@@ -251,13 +229,6 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
         throw new Error(errorMessage);
       }
 
-      // const outDir = path.dirname(finalDestLoc);
-      // const buildPipelineFile = new FileBuilder({
-      //   fileURL: url.pathToFileURL(fileLoc),
-      //   mountEntry,
-      //   outDir,
-      //   config,
-      // });
       const buildPipelineFile = new FileBuilder({
         loc: fileLoc,
         isSSR,
@@ -276,15 +247,9 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   // 1. Build all files for the first time, from source.
   const parallelWorkQueue = new PQueue({concurrency: CONCURRENT_WORKERS});
   const allBuildPipelineFiles = Object.values(buildPipelineFiles);
-  const buildResultManifest: SnowpackBuildResultFileManifest = {};
   for (const buildPipelineFile of allBuildPipelineFiles) {
     parallelWorkQueue.add(async () => {
       await buildPipelineFile.build();
-      const buildResults = await buildPipelineFile.getAllResults(); //.catch((err) => handleFileError(err, buildPipelineFile)));
-      for (const [buildUrl, buildResult] of Object.entries(buildResults)) {
-        buildResultManifest[buildUrl] = {contents: buildResult, source: buildPipelineFile.loc};
-      }
-      // buildResultManifest = {...buildResultManifest, ...
     });
   }
   await parallelWorkQueue.onIdle();
@@ -297,34 +262,63 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   );
 
   // 2. Install all dependencies. This gets us the import map we need to resolve imports.
-  const allBuiltFiles = Object.entries(buildResultManifest).map(([k, v]) => {
-    return {
-      baseExt: path.extname(k),
-      root: config.root,
-      contents: v.contents,
-      locOnDisk: path.join(buildDirectoryLoc, k),
-    };
-  });
-
+  const allBuiltFiles: SnowpackSourceFile[] = [];
+  for (const buildPipelineFile of allBuildPipelineFiles) {
+    for (const buildUrl of buildPipelineFile.urls) {
+      allBuiltFiles.push({
+        baseExt: path.extname(buildUrl),
+        root: config.root,
+        contents: buildPipelineFile.getResult(path.extname(buildUrl)),
+        locOnDisk: path.join(buildDirectoryLoc, buildUrl),
+      });
+    }
+  }
   let installResult = await installDependencies(allBuiltFiles);
 
-  logger.info(colors.yellow('! verifying build...'));
-
   // 3. Resolve all built file imports.
+  logger.info(colors.yellow('! verifying build...'));
   const verifyStart = performance.now();
+  const buildResultManifest: SnowpackBuildResultFileManifest = {};
   for (const buildPipelineFile of allBuildPipelineFiles) {
     parallelWorkQueue.add(async () => {
+      await buildPipelineFile.resolveImports(false, installResult.importMap!);
       for (const buildUrl of buildPipelineFile.urls) {
-        console.log(buildUrl, buildResultManifest[buildUrl].contents);
-        buildResultManifest[buildUrl].contents = await buildPipelineFile.resolveImports(
-          path.extname(buildUrl),
-          buildResultManifest[buildUrl].contents,
-          false,
-          installResult.importMap!,
-        );
-        // .catch((err) => handleFileError(err, buildPipelineFile)),
+        const type = path.extname(buildUrl);
+        buildResultManifest[buildUrl] = {
+          contents: buildPipelineFile.getResult(type),
+          source: buildPipelineFile.loc,
+        };
+        if (config.buildOptions.sourcemap) {
+          const sourceMapResult = await buildPipelineFile.getSourceMap(type);
+          if (sourceMapResult) {
+            buildResultManifest[buildUrl + '.map'] = {
+              contents: sourceMapResult,
+              source: buildPipelineFile.loc,
+            };
+          }
+        }
       }
     });
+  }
+  await parallelWorkQueue.onIdle();
+  // 3b. Handle all proxy imports, if needed.
+  const allImportProxyFiles = new Set(
+    allBuildPipelineFiles.map((b) => b.proxyImports).reduce((flat, item) => flat.concat(item), []),
+  );
+  for (const buildPipelineFile of allBuildPipelineFiles) {
+    for (const builtFileUrl of buildPipelineFile.urls) {
+      if (allImportProxyFiles.has(builtFileUrl)) {
+        parallelWorkQueue.add(async () => {
+          const type = path.extname(builtFileUrl);
+          const buildProxyResult = await buildPipelineFile.getProxy(builtFileUrl, type);
+          buildResultManifest[builtFileUrl + '.proxy.js'] = {
+            contents: buildProxyResult,
+            source: buildPipelineFile.loc,
+          };
+          // .catch((err) => handleFileError(err, buildPipelineFile)),
+        });
+      }
+    }
   }
   await parallelWorkQueue.onIdle();
   const verifyEnd = performance.now();
@@ -334,36 +328,25 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
     )}`,
   );
 
+  console.log('buildResultManifest', buildResultManifest);
+  async function writeToDisk(loc: string, result: string | Buffer) {
+    await mkdirp(path.dirname(loc));
+    const encoding = typeof result === 'string' ? 'utf8' : undefined;
+    await fs.writeFile(loc, result, encoding);
+  }
+
   // 4. Write files to disk.
   logger.info(colors.yellow('! writing build to disk...'));
-  const allImportProxyFiles = new Set(
-    allBuildPipelineFiles.map((b) => b.proxyImports).reduce((flat, item) => flat.concat(item), []),
-    );
-    console.log(allImportProxyFiles);
-  for (const buildPipelineFile of allBuildPipelineFiles) {
+  console.log(allImportProxyFiles);
+  for (const buildResultUrl of Object.keys(buildResultManifest)) {
     parallelWorkQueue.add(() =>
-      buildPipelineFile.writeToDisk(buildDirectoryLoc, buildResultManifest),
+      writeToDisk(
+        path.join(buildDirectoryLoc, buildResultUrl),
+        buildResultManifest[buildResultUrl].contents,
+      ),
     );
-    for (const builtFile of buildPipelineFile.urls) {
-      if (allImportProxyFiles.has(builtFile)) {
-        parallelWorkQueue.add(async () => {
-          const result = await buildPipelineFile.getProxy(builtFile, path.extname(builtFile));
-          await mkdirp(path.dirname(path.join(buildDirectoryLoc, builtFile)));
-          return fs.writeFile(path.join(buildDirectoryLoc, builtFile + '.proxy.js'), result, 'utf8');
-          // .catch((err) => handleFileError(err, buildPipelineFile)),
-        }
-        );
-      }
-    }
   }
   await parallelWorkQueue.onIdle();
-
-  // TODO(fks): Add support for virtual files (injected by snowpack, plugins)
-  // and web_modules in this manifest.
-  // buildResultManifest[path.join(internalFilesBuildLoc, 'env.js')] = {
-  //   source: null,
-  //   contents: generateEnvModule({mode: 'production', isSSR}),
-  // };
 
   // "--watch --hmr" mode - Tell users about the HMR WebSocket URL
   if (hmrEngine) {
@@ -390,19 +373,19 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
           `[${((optimizeEnd - optimizeStart) / 1000).toFixed(2)}s]`,
         )}`,
       );
-      await removeEmptyFolders(buildDirectoryLoc);
-      await runPipelineCleanupStep(config);
-      logger.info(`${colors.underline(colors.green(colors.bold('▶ Build Complete!')))}\n\n`);
-      return {
-        result: buildResultManifest,
-        onFileChange: () => {
-          throw new Error('build().onFileChange() only supported in "watch" mode.');
-        },
-        shutdown: () => {
-          throw new Error('build().shutdown() only supported in "watch" mode.');
-        },
-      };
     }
+    await removeEmptyFolders(buildDirectoryLoc);
+    await runPipelineCleanupStep(config);
+    logger.info(`${colors.underline(colors.green(colors.bold('▶ Build Complete!')))}\n\n`);
+    return {
+      result: buildResultManifest,
+      onFileChange: () => {
+        throw new Error('build().onFileChange() only supported in "watch" mode.');
+      },
+      shutdown: () => {
+        throw new Error('build().shutdown() only supported in "watch" mode.');
+      },
+    };
   }
 
   // "--watch" mode - Start watching the file system.
@@ -420,19 +403,19 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
       return;
     }
     onFileChangeCallback({filePath: fileLoc});
-    const [mountKey, mountEntry] = mountEntryResult;
-    const finalUrl = getUrlsForFileMount({fileLoc, mountKey, mountEntry, config})![0];
-    const finalDest = path.join(buildDirectoryLoc, finalUrl);
-    const outDir = path.dirname(finalDest);
+    const [, mountEntry] = mountEntryResult;
     const changedPipelineFile = new FileBuilder({
-      fileURL: url.pathToFileURL(fileLoc),
-      mountEntry,
-      outDir,
+      loc: fileLoc,
+      isSSR,
+      isHMR: getIsHmrEnabled(config),
       config,
+      isStatic: mountEntry.static,
+      isResolve: mountEntry.resolve,
+      hmrEngine: hmrEngine,
     });
     buildPipelineFiles[fileLoc] = changedPipelineFile;
     // 1. Build the file.
-    await changedPipelineFile.buildFile().catch((err) => {
+    await changedPipelineFile.build().catch((err) => {
       logger.error(fileLoc + ' ' + err.toString(), {name: err.__snowpackBuildDetails?.name});
       hmrEngine &&
         hmrEngine.broadcastMessage({
@@ -447,29 +430,41 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
         });
     });
     // 2. Resolve any ESM imports. Handle new imports by triggering a re-install.
-    let resolveSuccess = await changedPipelineFile.resolveImports(installResult.importMap!);
-    if (!resolveSuccess) {
-      await installDependencies();
-      resolveSuccess = await changedPipelineFile.resolveImports(installResult.importMap!);
-      if (!resolveSuccess) {
-        logger.error('Exiting...');
-        process.exit(1);
-      }
-    }
+    await changedPipelineFile.resolveImports(false, installResult.importMap!);
+    // TODO: What happens if new dependnecy is added?
+    // In build mode, we shouldn't use single install. Instead, we should do the normal
+    // dev install which includes live updating of dependencies.
+
     // 3. Write to disk. If any proxy imports are needed, write those as well.
-    await changedPipelineFile.writeToDisk();
+    for (const [buildResultUrl, buildResult] of Object.entries(
+      await changedPipelineFile.getAllResults(),
+    )) {
+      await writeToDisk(path.join(buildDirectoryLoc, buildResultUrl), buildResult);
+    }
     const allBuildPipelineFiles = Object.values(buildPipelineFiles);
     const allImportProxyFiles = new Set(
       allBuildPipelineFiles
-        .map((b) => b.filesToProxy)
+        .map((b) => b.proxyImports)
         .reduce((flat, item) => flat.concat(item), []),
     );
-    for (const builtFile of Object.keys(changedPipelineFile.output)) {
-      if (allImportProxyFiles.has(builtFile)) {
-        await changedPipelineFile.writeProxyToDisk(builtFile);
+    for (const builtResultUrl of changedPipelineFile.urls) {
+      const type = path.extname(builtResultUrl);
+      if (config.buildOptions.sourcemap) {
+        const changedFileSourceMap = await changedPipelineFile.getSourceMap(type);
+        if (changedFileSourceMap) {
+          await writeToDisk(
+            path.join(buildDirectoryLoc, builtResultUrl + '.proxy.js'),
+            changedFileSourceMap,
+          );
+        }
+      }
+      if (allImportProxyFiles.has(builtResultUrl)) {
+        await writeToDisk(
+          path.join(buildDirectoryLoc, builtResultUrl + '.proxy.js'),
+          await changedPipelineFile.getProxy(builtResultUrl, type),
+        );
       }
     }
-
     if (hmrEngine) {
       hmrEngine.broadcastMessage({type: 'reload'});
     }

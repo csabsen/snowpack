@@ -5,6 +5,7 @@ import {existsSync, promises as fs} from 'fs';
 import PQueue from 'p-queue';
 import path from 'path';
 import rimraf from 'rimraf';
+import { getBuiltFileUrls } from '../build/file-urls';
 import {logger} from '../logger';
 import {scanCodeImportsExports, transformFileImports} from '../rewrite-imports';
 import {getInstallTargets} from '../scan-imports';
@@ -46,8 +47,13 @@ type PackageImportData = {
   packageName: string;
 };
 const allPackageImports: Record<string, PackageImportData> = {};
+const allSymlinkImports: Record<string, string> = {};
 const allKnownSpecs = new Set<string>();
 const inProgressBuilds = new PQueue({concurrency: 1});
+
+export function getLinkedUrl(builtUrl: string) {
+  return allSymlinkImports[builtUrl];
+}
 
 /**
  * Local Package Source: A generic interface through which Snowpack
@@ -124,6 +130,10 @@ export default {
     return installOptions;
   },
 
+  // TODO: in build+watch, run prepare() 
+  //  then, no import map
+  // 
+
   async prepare(commandOptions: CommandOptions) {
     console.time('SYNC');
     config = commandOptions.config;
@@ -166,6 +176,20 @@ export default {
       cwd: path.dirname(source),
       packageLookupFields: ['svelte'],
     });
+    const specParts = spec.split('/');
+    let _packageName: string = specParts.shift()!;
+    if (_packageName?.startsWith('@')) {
+      _packageName += path.sep + specParts.shift();
+    }
+    const isLinked = !entrypoint.includes(path.join('node_modules', _packageName));
+    console.log(isLinked, _packageName, entrypoint, path.join('node_modules', _packageName));
+    if (isLinked) {
+      const builtEntrypointUrls = getBuiltFileUrls(entrypoint, config);
+      console.log('builtEntrypointUrls', builtEntrypointUrls);
+      allSymlinkImports[builtEntrypointUrls[0]] = entrypoint;
+      return path.posix.join(config.buildOptions.metaUrlPath, 'link', builtEntrypointUrls[0]);
+    }
+
     const rootPackageDirectory = getRootPackageDirectory(entrypoint);
     const packageManifestLoc = path.join(rootPackageDirectory, 'package.json');
     const packageManifestStr = await fs.readFile(packageManifestLoc, 'utf8');
@@ -282,3 +306,11 @@ export default {
     return PROJECT_CACHE_DIR;
   },
 } as PackageSource;
+
+
+
+// TODO: Handle monorepo!
+// TODO: Handle passing all relevant install options
+// InstallOptions: alias,  importMap (for CDN aliases?),  verbose?,  env,  polyfillNode,  sourcemap?,  external,  packageLookupFields,  packageExportLookupFields,  namedExports,
+// TODO: Handle svelte plugin telling us about svelte entrypoint
+// TODO: Handle svelte plugin telling us about svelte = needing ssr?

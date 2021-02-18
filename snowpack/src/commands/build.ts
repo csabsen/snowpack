@@ -362,12 +362,7 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
       const optimizeStart = performance.now();
       logger.info(colors.yellow('! optimizing build...'));
       await runBuiltInOptimize(config);
-      await runPipelineOptimizeStep(buildDirectoryLoc, {
-        config,
-        isDev: false,
-        isSSR: config.buildOptions.ssr,
-        isHmrEnabled: false,
-      });
+      await runPipelineOptimizeStep(buildDirectoryLoc, {config});
       const optimizeEnd = performance.now();
       logger.info(
         `${colors.green('✔')} optimize complete ${colors.dim(
@@ -432,9 +427,18 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
     });
     // 2. Resolve any ESM imports. Handle new imports by triggering a re-install.
     await changedPipelineFile.resolveImports(false, installResult.importMap!);
-    // TODO: What happens if new dependnecy is added?
-    // In build mode, we shouldn't use single install. Instead, we should do the normal
-    // dev install which includes live updating of dependencies.
+    
+    // TODO: What happens if new dependency is added?
+    // 1. scan imports, if it doesn't exist in importMap then re-install all
+    // 2. (harder) start using the dev, unbundled package experience
+    // TODO: What happens if symlink detected?
+    // 1. same as above
+    // 2. (harder) copy it into the directory at its URL?
+
+    // FileBuilder gives us a way to map file paths to URLs
+    // we need some way to do the same inside of packageSource
+    // related: buildResultManifest is missing dependencies?
+    // best guess: do (1) above now, and then come back for (2) later.
 
     // 3. Write to disk. If any proxy imports are needed, write those as well.
     for (const [buildResultUrl, buildResult] of Object.entries(

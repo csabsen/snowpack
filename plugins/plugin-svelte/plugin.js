@@ -1,5 +1,4 @@
 const svelte = require('svelte/compiler');
-const svelteRollupPlugin = require('rollup-plugin-svelte');
 const fs = require('fs');
 const path = require('path');
 const {createMakeHot} = require('svelte-hmr');
@@ -85,7 +84,7 @@ module.exports = function plugin(snowpackConfig, pluginOptions = {}) {
       'svelte-hmr/runtime/hot-api-esm.js',
       'svelte-hmr/runtime/proxy-adapter-dom.js',
     ],
-    async load({filePath, isHmrEnabled, isSSR}) {
+    async load({filePath, isHmrEnabled, isSSR, isPackage}) {
       let codeToCompile = await fs.promises.readFile(filePath, 'utf-8');
       // PRE-PROCESS
       if (preprocessOptions !== false) {
@@ -98,7 +97,7 @@ module.exports = function plugin(snowpackConfig, pluginOptions = {}) {
 
       const finalCompileOptions = {
         generate: isSSR ? 'ssr' : 'dom',
-        css: false,
+        css: isPackage ? true : false,
         ...compilerOptions, // Note(drew) should take precedence over generate above
         dev: isDev,
         outputFilename: filePath,

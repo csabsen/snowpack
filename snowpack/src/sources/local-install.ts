@@ -1,8 +1,4 @@
-import {
-  install,
-  InstallOptions as EsinstallOptions,
-  InstallTarget,
-} from 'esinstall';
+import {install, InstallOptions as EsinstallOptions, InstallTarget} from 'esinstall';
 import * as colors from 'kleur/colors';
 import {performance} from 'perf_hooks';
 import util from 'util';
@@ -63,6 +59,7 @@ export async function installPackages({
               config,
               isDev,
               isSSR,
+              isPackage: true,
               isHmrEnabled: false,
             });
             let jsResponse;
@@ -92,10 +89,3 @@ export async function installPackages({
 
   return {importMap: finalResult.importMap, needsSsrBuild};
 }
-
-
-            // TODO (short-term fix): if building a dependency, svelte's CSS mode should be "false"
-            // TODO (future PR): support CSS
-            // - emit the CSS file, if one exists (true for any non-js output)
-            // - add a CSS import with `.proxy.js` suffix
-            // - make sure that

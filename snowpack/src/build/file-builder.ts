@@ -29,7 +29,8 @@ import {createImportResolver} from './import-resolver';
  * in stages (build -> resolve -> get response).
  */
 export class FileBuilder {
-  output: SnowpackBuildMap = {};
+  buildOutput: SnowpackBuildMap = {};
+  resolvedOutput: SnowpackBuildMap = {};
   proxyImports: string[] = [];
 
   isHMR: boolean;
@@ -67,16 +68,16 @@ export class FileBuilder {
     this.isResolve = isResolve;
     this.config = config;
     this.hmrEngine = hmrEngine || null;
-
-    this.urls = getUrlsForFile(loc, config)!;
+    this.urls = getUrlsForFile(loc, config);
+    console.log(this.urls);
   }
 
   private verifyRequestFromBuild(type: string): SnowpackBuiltFile {
     // Verify that the requested file exists in the build output map.
-    if (!this.output[type] || !Object.keys(this.output)) {
-      throw new Error(`Requested content "${type}" but built ${Object.keys(this.output)}`);
+    if (!this.resolvedOutput[type] || !Object.keys(this.resolvedOutput)) {
+      throw new Error(`Requested content "${type}" but built ${Object.keys(this.resolvedOutput)}`);
     }
-    return this.output[type];
+    return this.resolvedOutput[type];
   }
 
   /**
@@ -86,7 +87,7 @@ export class FileBuilder {
   async resolveImports(hmrParam?: string | false, importMap?: ImportMap): Promise<void> {
     const urlPathDirectory = path.posix.dirname(this.urls[0]!);
     const pkgSource = getPackageSource(this.config.packageOptions.source);
-    for (const [type, outputResult] of Object.entries(this.output)) {
+    for (const [type, outputResult] of Object.entries(this.buildOutput)) {
       console.log('OKAY', this.loc, type);
       if (!(type === '.js' || type === '.html' || type === '.css')) {
         continue;
@@ -97,7 +98,7 @@ export class FileBuilder {
           : outputResult.code.toString('utf8');
 
       // Handle attached CSS.
-      if (type === '.js' && this.output['.css']) {
+      if (type === '.js' && this.buildOutput['.css']) {
         const relativeCssImport = `./${replaceExtension(
           path.posix.basename(this.urls[0]!),
           '.js',
@@ -188,7 +189,8 @@ export class FileBuilder {
         this.hmrEngine?.setEntry(this.urls[0], resolvedImports, isHmrEnabled);
       }
       // Update the output with the new resolved imports
-      outputResult.code = contents;
+      this.resolvedOutput[type].code = contents;
+      this.resolvedOutput[type].map = undefined;
     }
   }
 
@@ -207,13 +209,19 @@ export class FileBuilder {
         config: this.config,
         isDev: true,
         isSSR: this.isSSR,
+        isPackage: false,
         isHmrEnabled: this.isHMR,
       });
       return builtFileOutput;
     })();
     this.buildPromise = fileBuilderPromise;
     try {
-      this.output = await fileBuilderPromise;
+      this.resolvedOutput = {};
+      this.buildOutput = await fileBuilderPromise;
+      console.log(this.buildOutput);
+      for (const [outputKey, {code, map}] of Object.entries(this.buildOutput)) {
+        this.resolvedOutput[outputKey] = {code, map};
+      }
     } finally {
       this.buildPromise = undefined;
     }
@@ -287,10 +295,10 @@ export class FileBuilder {
   //   }
 
   async getSourceMap(type: string): Promise<string | undefined> {
-    return this.output[type].map;
+    return this.resolvedOutput[type].map;
   }
   async getProxy(url: string, type: string) {
-    const code = this.output[type].code;
+    const code = this.resolvedOutput[type].code;
     // TODO: support css modules
     return await wrapImportProxy({url, code, hmr: this.isHMR, config: this.config});
   }
@@ -300,7 +308,7 @@ export class FileBuilder {
   async writeToDisk(dir: string, results: SnowpackBuildResultFileManifest) {
     await mkdirp(path.dirname(path.join(dir, this.urls[0])));
     for (const outUrl of this.urls) {
-      //   const buildOutput = this.output[path.extname(outUrl)];
+      //   const buildOutput = this.resolvedOutput[path.extname(outUrl)];
       const buildOutput = results[outUrl].contents;
       const encoding = typeof buildOutput === 'string' ? 'utf8' : undefined;
       await fs.writeFile(path.join(dir, outUrl), buildOutput, encoding);

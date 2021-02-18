@@ -1,4 +1,5 @@
 import isCompressible from 'compressible';
+import {resolveEntrypoint} from 'esinstall';
 import etag from 'etag';
 import {EventEmitter} from 'events';
 import {createReadStream, promises as fs, statSync} from 'fs';
@@ -17,7 +18,7 @@ import util from 'util';
 import zlib from 'zlib';
 import {generateEnvModule, getMetaUrlPath} from '../build/build-import-proxy';
 import {FileBuilder} from '../build/file-builder';
-import {getMountEntryForFile, getUrlsForFile} from '../build/file-urls';
+import {getBuiltFileUrls, getMountEntryForFile, getUrlsForFile} from '../build/file-urls';
 import {EsmHmrEngine} from '../hmr-server-engine';
 import {logger} from '../logger';
 import {getPackageSource} from '../sources/util';
@@ -246,6 +247,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
   const port = await getPort(defaultPort);
   const pkgSource = getPackageSource(config.packageOptions.source);
   const PACKAGE_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'pkg/');
+  const PACKAGE_LINK_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'link/');
 
   // Reset the clock if we had to wait for the user prompt to select a new port.
   if (port !== defaultPort) {
@@ -284,6 +286,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     });
   }
 
+  const symlinkDirectories = new Set();
   const inMemoryBuildCache = new Map<string, FileBuilder>();
   let fileToUrlMapping = new OneToManyMap();
 
@@ -437,27 +440,64 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       };
     }
 
-    const attemptedFileLoc =
-      fileToUrlMapping.key(resourcePath) ||
-      fileToUrlMapping.key(resourcePath + '.html') ||
-      fileToUrlMapping.key(resourcePath + 'index.html') ||
-      fileToUrlMapping.key(resourcePath + '/index.html');
-    if (!attemptedFileLoc) {
-      throw new NotFoundError([reqPath]);
+    let foundFile: FoundFile;
+    if (reqPath.startsWith(PACKAGE_LINK_PATH_PREFIX)) {
+      // const webModuleUrl = reqPath.substr(PACKAGE_LINK_PATH_PREFIX.length);
+      // const entrypoint = resolveEntrypoint(webModuleUrl, {
+      //   cwd: config.root,
+      //   packageLookupFields: ['svelte'],
+      // });
+      const symlinkResourcePath = '/' + reqPath.substr(PACKAGE_LINK_PATH_PREFIX.length);
+      const symlinkResourceDirectory = path.dirname(symlinkResourcePath);
+      if (!symlinkDirectories.has(symlinkResourceDirectory)) {
+        symlinkDirectories.add(symlinkResourceDirectory);
+        watcher && watcher.add(symlinkResourceDirectory);
+        logger.debug(
+          `Mounting symlink directory: '${symlinkResourceDirectory}' as URL '${path.dirname(
+            reqPath,
+          )}'`,
+        );
+        const files = glob.sync(path.join(symlinkResourceDirectory, '*'), {nodir: true});
+        for (const f of files) {
+          const builtEntrypointUrls = getBuiltFileUrls(f, config);
+          console.log("ADDED", f, builtEntrypointUrls);
+          fileToUrlMapping.add(f, builtEntrypointUrls);
+        }
+      }
+
+      // TODO: scan this directory as if it were a mount entry
+      // then, check the map
+      console.log('getLinkedUrl', symlinkResourcePath, fileToUrlMapping.key(symlinkResourcePath));
+      foundFile = {
+        loc: fileToUrlMapping.key(symlinkResourcePath)!,
+        type: path.extname(reqPath),
+        contents: await fs.readFile(fileToUrlMapping.key(symlinkResourcePath)!),
+        isStatic: false,
+        isResolve: true,
+      };
+    } else {
+      const attemptedFileLoc =
+        fileToUrlMapping.key(resourcePath) ||
+        fileToUrlMapping.key(resourcePath + '.html') ||
+        fileToUrlMapping.key(resourcePath + 'index.html') ||
+        fileToUrlMapping.key(resourcePath + '/index.html');
+      if (!attemptedFileLoc) {
+        throw new NotFoundError([reqPath]);
+      }
+
+      const [, mountEntry] = getMountEntryForFile(attemptedFileLoc, config)!;
+
+      // TODO: This data type structuring/destructuring is unesccesary for now,
+      // but we hope to add "virtual file" support soon via plugins. This would
+      // be the interface for those response types.
+      foundFile = {
+        loc: attemptedFileLoc,
+        type: path.extname(reqPath) || '.html',
+        contents: await fs.readFile(attemptedFileLoc),
+        isStatic: mountEntry.static,
+        isResolve: mountEntry.resolve,
+      };
     }
-
-    const [, mountEntry] = getMountEntryForFile(attemptedFileLoc, config)!;
-
-    // TODO: This data type structuring/destructuring is unesccesary for now,
-    // but we hope to add "virtual file" support soon via plugins. This would
-    // be the interface for those response types.
-    const foundFile: FoundFile = {
-      loc: attemptedFileLoc,
-      type: path.extname(reqPath) || '.html',
-      contents: await fs.readFile(attemptedFileLoc),
-      isStatic: mountEntry.static,
-      isResolve: mountEntry.resolve,
-    };
 
     const {
       loc: fileLoc,
@@ -754,6 +794,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     logger.info(colors.cyan('File changed...'));
     onFileChangeCallback({filePath: fileLoc});
     const updatedUrls = getUrlsForFile(fileLoc, config);
+    console.log('updatedUrls', updatedUrls);
     if (updatedUrls) {
       handleHmrUpdate(fileLoc, updatedUrls[0]);
       knownETags.delete(updatedUrls[0]);

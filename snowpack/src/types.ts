@@ -126,10 +126,12 @@ export interface PluginLoadOptions {
   fileExt: string;
   /** True if builder is in dev mode (`snowpack dev` or `snowpack build --watch`) */
   isDev: boolean;
-  /** True if builder is in SSR mode */
-  isSSR: boolean;
   /** True if HMR is enabled (add any HMR code to the output here). */
   isHmrEnabled: boolean;
+  /** True if builder is in SSR mode */
+  isSSR: boolean;
+  /** True if file being transformed is inside of a package. */
+  isPackage: boolean;
 }
 
 export interface PluginTransformOptions {
@@ -145,6 +147,8 @@ export interface PluginTransformOptions {
   isHmrEnabled: boolean;
   /** True if builder is in SSR mode */
   isSSR: boolean;
+  /** True if file being transformed is inside of a package. */
+  isPackage: boolean;
 }
 
 export interface PluginRunOptions {

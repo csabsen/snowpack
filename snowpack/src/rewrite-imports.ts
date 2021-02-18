@@ -51,7 +51,10 @@ export async function transformEsmImports(
   return rewrittenCode;
 }
 
-async function transformHtmlImports(code: string, replaceImport: (specifier: string) => string | Promise<string>) {
+async function transformHtmlImports(
+  code: string,
+  replaceImport: (specifier: string) => string | Promise<string>,
+) {
   let rewrittenCode = code;
   let match;
   const jsImportRegex = new RegExp(HTML_JS_REGEX);
@@ -83,7 +86,10 @@ async function transformHtmlImports(code: string, replaceImport: (specifier: str
   return rewrittenCode;
 }
 
-async function transformCssImports(code: string, replaceImport: (specifier: string) => string | Promise<string>) {
+async function transformCssImports(
+  code: string,
+  replaceImport: (specifier: string) => string | Promise<string>,
+) {
   let rewrittenCode = code;
   let match;
   const importRegex = new RegExp(CSS_REGEX);

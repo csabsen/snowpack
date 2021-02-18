@@ -1,6 +1,6 @@
 import path from 'path';
 import {MountEntry, SnowpackConfig} from '../types';
-import {replaceExtension, getExtensionMatch, addExtension} from '../util';
+import {replaceExtension, getExtensionMatch, addExtension, removeExtension} from '../util';
 
 /**
  * Map a file path to the hosted URL for a given "mount" entry.
@@ -68,10 +68,11 @@ export function getMountEntryForFile(
 /**
  * Get the final, hosted URL path for a given file on disk.
  */
-export function getUrlsForFile(fileLoc: string, config: SnowpackConfig): string[] | null {
+export function getUrlsForFile(fileLoc: string, config: SnowpackConfig): string[] {
   const mountEntryResult = getMountEntryForFile(fileLoc, config);
   if (!mountEntryResult) {
-    return null;
+    const builtEntrypointUrls = getBuiltFileUrls(fileLoc, config);
+    return builtEntrypointUrls.map((u) => path.posix.join(config.buildOptions.metaUrlPath, 'link', u));
   }
   const [mountKey, mountEntry] = mountEntryResult;
   return getUrlsForFileMount({fileLoc, mountKey, mountEntry, config});

@@ -5,12 +5,7 @@ import rimraf from 'rimraf';
 import {clearCache as clearSkypackCache, rollupPluginSkypack} from 'skypack';
 import util from 'util';
 import {logger} from '../logger';
-import {
-  LockfileManifest,
-  PackageSource,
-  PackageSourceRemote,
-  SnowpackConfig,
-} from '../types';
+import {LockfileManifest, PackageSource, PackageSourceRemote, SnowpackConfig} from '../types';
 import {convertLockfileToSkypackImportMap, isJavaScript, remotePackageSDK} from '../util';
 
 const fetchedPackages = new Set<string>();

@@ -1,19 +1,16 @@
 import crypto from 'crypto';
-import {install as esinstall, resolveEntrypoint} from 'esinstall';
+import {resolveEntrypoint} from 'esinstall';
 import projectCacheDir from 'find-cache-dir';
 import {existsSync, promises as fs} from 'fs';
 import PQueue from 'p-queue';
 import path from 'path';
 import rimraf from 'rimraf';
-import type {Plugin as RollupPlugin} from 'rollup';
-import url from 'url';
-import util from 'util';
-import {buildFile} from '../build/build-pipeline';
 import {logger} from '../logger';
 import {scanCodeImportsExports, transformFileImports} from '../rewrite-imports';
 import {getInstallTargets} from '../scan-imports';
 import {CommandOptions, ImportMap, PackageSource, SnowpackConfig} from '../types';
 import {GLOBAL_CACHE_DIR, isJavaScript, isRemoteUrl} from '../util';
+import {installPackages} from './local-install';
 
 const PROJECT_CACHE_DIR =
   projectCacheDir({name: 'snowpack'}) ||
@@ -33,80 +30,6 @@ function getRootPackageDirectory(loc: string) {
   } else {
     return path.join(packageRoot, packageParts[0]);
   }
-}
-
-async function installPackage({
-  isSSR,
-  installDest,
-  packageManifest,
-  packageManifestLoc,
-}: {
-  isSSR: boolean;
-  installDest: string;
-  packageManifest: any;
-  packageManifestLoc: string;
-}): Promise<{importMap: ImportMap, needsSsrBuild: boolean}> {
-  let needsSsrBuild = false;
-  let installEntrypoints = [...allKnownSpecs].filter(
-    (spec) => spec === packageManifest.name || spec.startsWith(packageManifest.name + '/'),
-  );
-
-  // TODO: external should be a function in esinstall
-  const external = [
-    ...Object.keys(packageManifest.dependencies || {}),
-    ...Object.keys(packageManifest.devDependencies || {}),
-    ...Object.keys(packageManifest.peerDependencies || {}),
-  ];
-
-  const finalResult = await esinstall(installEntrypoints, {
-    dest: installDest,
-    env: {NODE_ENV: process.env.NODE_ENV || 'development'},
-    treeshake: false,
-    cwd: packageManifestLoc,
-    external,
-    externalEsm: external,
-    logger: {
-      debug: (...args: [any, ...any[]]) => logger.debug(util.format(...args)),
-      log: (...args: [any, ...any[]]) => logger.info(util.format(...args)),
-      warn: (...args: [any, ...any[]]) => logger.warn(util.format(...args)),
-      error: (...args: [any, ...any[]]) => logger.error(util.format(...args)),
-    },
-    rollup: {
-      plugins: [
-        {
-          name: 'esinstall:snowpack',
-          // resolveId(source: string, importer: string | undefined) {
-          // console.log('resolveId()', source);
-          //   return source;
-          // },
-          async load(id: string) {
-            // console.log('load()', id);
-            needsSsrBuild = needsSsrBuild || id.endsWith('.svelte');
-            const output = await buildFile(url.pathToFileURL(id), {
-              config,
-              isDev: true,
-              isSSR,
-              isHmrEnabled: false,
-            });
-            let jsResponse;
-            for (const [outputType, outputContents] of Object.entries(output)) {
-              if (jsResponse) {
-                console.log(`load() Err: ${Object.keys(output)}`);
-              }
-              if (!jsResponse || outputType === '.js') {
-                jsResponse = outputContents;
-              }
-            }
-            // TODO: Combine this with local-install.ts
-            // TODO: support CSS - add an import if needed?
-            return jsResponse;
-          },
-        } as RollupPlugin,
-      ],
-    },
-  });
-
-  return {importMap: finalResult.importMap, needsSsrBuild};
 }
 
 // A bit of a hack: we keep this in local state and populate it
@@ -229,11 +152,7 @@ export default {
     }
     await Promise.all(
       [...new Set(installTargets.map((t) => t.specifier))].map((spec) => {
-        return this.resolvePackageImport(
-          path.join(config.root, 'package.json'),
-          spec,
-          config,
-        );
+        return this.resolvePackageImport(path.join(config.root, 'package.json'), spec, config);
       }),
     );
     await fs.writeFile(installDirectoryHashLoc, 'v1', 'utf-8');
@@ -271,20 +190,44 @@ export default {
         }
         // Otherwise, kick off a new build to generate a fresh import map.
         console.log(`Installing ${spec}...`);
-        const {importMap: newImportMap, needsSsrBuild} = await installPackage({
+
+        const installTargets = [...allKnownSpecs].filter(
+          (spec) => spec === packageManifest.name || spec.startsWith(packageManifest.name + '/'),
+        );
+
+        // TODO: external should be a function in esinstall
+        const externalPackages = [
+          ...Object.keys(packageManifest.dependencies || {}),
+          ...Object.keys(packageManifest.devDependencies || {}),
+          ...Object.keys(packageManifest.peerDependencies || {}),
+        ];
+        const installOptions = {
+          dest: installDest,
+          cwd: packageManifestLoc,
+          env: {NODE_ENV: process.env.NODE_ENV || 'development'},
+          treeshake: false,
+          external: externalPackages,
+          externalEsm: externalPackages,
+        };
+        const {importMap: newImportMap, needsSsrBuild} = await installPackages({
+          config,
+          isDev: true,
           isSSR: false,
-          installDest,
-          packageManifest,
-          packageManifestLoc,
+          installTargets,
+          installOptions,
         });
         console.log(`Installing ${spec}... DONE`, Object.keys(newImportMap.imports));
         if (needsSsrBuild) {
           console.log(`Installing ${spec} (ssr)...`);
-          await installPackage({
+          await installPackages({
+            config,
+            isDev: true,
             isSSR: true,
-            installDest: installDest + '-ssr',
-            packageManifest,
-            packageManifestLoc,
+            installTargets,
+            installOptions: {
+              ...installOptions,
+              dest: installDest + '-ssr',
+            },
           });
           console.log(`Installing ${spec} (ssr)... DONE`);
         }

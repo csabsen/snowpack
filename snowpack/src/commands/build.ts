@@ -14,7 +14,7 @@ import {runBuiltInOptimize} from '../build/optimize';
 import {EsmHmrEngine} from '../hmr-server-engine';
 import {logger} from '../logger';
 import {getInstallTargets} from '../scan-imports';
-import {run as installRunner} from '../sources/local-install';
+import {installPackages} from '../sources/local-install';
 import {getPackageSource} from '../sources/util';
 import {
   CommandOptions,
@@ -88,11 +88,12 @@ async function installOptimizedDependencies(
   // will can scan all used entrypoints. Set to `[]` to improve tree-shaking performance.
   const installTargets = await getInstallTargets(commandOptions.config, [], scannedFiles);
   // 2. Install dependencies, based on the scan of your final build.
-  const installResult = await installRunner({
+  const installResult = await installPackages({
+    config: commandOptions.config,
+    isSSR: commandOptions.config.buildOptions.ssr,
+    isDev: false,
     installTargets,
     installOptions,
-    config: commandOptions.config,
-    shouldPrintStats: false,
   });
   return installResult;
 }

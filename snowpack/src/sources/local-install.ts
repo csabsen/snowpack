@@ -1,9 +1,7 @@
 import {
-  DependencyStatsOutput,
   install,
   InstallOptions as EsinstallOptions,
   InstallTarget,
-  printStats,
 } from 'esinstall';
 import * as colors from 'kleur/colors';
 import {performance} from 'perf_hooks';
@@ -13,40 +11,39 @@ import {buildFile} from '../build/build-pipeline';
 import {logger} from '../logger';
 import {ImportMap, SnowpackConfig} from '../types';
 
-interface InstallRunOptions {
+interface InstallOptions {
   config: SnowpackConfig;
+  isDev: boolean;
+  isSSR: boolean;
   installOptions: EsinstallOptions;
-  installTargets: InstallTarget[];
-  shouldPrintStats: boolean;
+  installTargets: (InstallTarget | string)[];
 }
 
-interface InstallRunResult {
+interface InstallResult {
   importMap: ImportMap;
-  newLockfile: ImportMap | null;
-  stats: DependencyStatsOutput | null;
+  needsSsrBuild: boolean;
 }
 
-export async function run({
+export async function installPackages({
   config,
+  isDev,
+  isSSR,
   installOptions,
   installTargets,
-  shouldPrintStats,
-}: InstallRunOptions): Promise<InstallRunResult> {
+}: InstallOptions): Promise<InstallResult> {
   if (installTargets.length === 0) {
     return {
       importMap: {imports: {}} as ImportMap,
-      newLockfile: null,
-      stats: null,
+      needsSsrBuild: false,
     };
   }
   // start
   const installStart = performance.now();
+  let needsSsrBuild = false;
   logger.info(colors.yellow('! building dependencies...'));
 
-  let newLockfile: ImportMap | null = null;
   const finalResult = await install(installTargets, {
     cwd: config.root,
-    importMap: newLockfile || undefined,
     alias: config.alias,
     logger: {
       debug: (...args: [any, ...any[]]) => logger.debug(util.format(...args)),
@@ -61,10 +58,11 @@ export async function run({
           name: 'esinstall:snowpack',
           async load(id: string) {
             console.log('load()', id);
+            needsSsrBuild = needsSsrBuild || id.endsWith('.svelte');
             const output = await buildFile(url.pathToFileURL(id), {
               config,
-              isDev: true,
-              isSSR: config.buildOptions.ssr,
+              isDev,
+              isSSR,
               isHmrEnabled: false,
             });
             let jsResponse;
@@ -92,13 +90,12 @@ export async function run({
     )}`,
   );
 
-  if (shouldPrintStats && finalResult.stats) {
-    logger.info(printStats(finalResult.stats));
-  }
-
-  return {
-    importMap: finalResult.importMap,
-    newLockfile,
-    stats: finalResult.stats!,
-  };
+  return {importMap: finalResult.importMap, needsSsrBuild};
 }
+
+
+            // TODO (short-term fix): if building a dependency, svelte's CSS mode should be "false"
+            // TODO (future PR): support CSS
+            // - emit the CSS file, if one exists (true for any non-js output)
+            // - add a CSS import with `.proxy.js` suffix
+            // - make sure that

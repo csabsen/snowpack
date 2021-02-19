@@ -33,10 +33,7 @@ export async function installPackages({
       needsSsrBuild: false,
     };
   }
-  // start
-  const installStart = performance.now();
   let needsSsrBuild = false;
-  logger.info(colors.yellow('! building dependencies...'));
 
   const finalResult = await install(installTargets, {
     cwd: config.root,
@@ -53,7 +50,7 @@ export async function installPackages({
         {
           name: 'esinstall:snowpack',
           async load(id: string) {
-            console.log('load()', id);
+            // console.log('load()', id);
             needsSsrBuild = needsSsrBuild || id.endsWith('.svelte');
             const output = await buildFile(url.pathToFileURL(id), {
               config,
@@ -78,14 +75,5 @@ export async function installPackages({
     },
   });
   logger.debug('Successfully ran esinstall.');
-
-  // finish
-  const installEnd = performance.now();
-  logger.info(
-    `${colors.green(`✔`) + ' dependencies ready!'} ${colors.dim(
-      `[${((installEnd - installStart) / 1000).toFixed(2)}s]`,
-    )}`,
-  );
-
   return {importMap: finalResult.importMap, needsSsrBuild};
 }

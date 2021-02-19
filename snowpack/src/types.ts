@@ -1,5 +1,7 @@
 import type {InstallOptions as EsinstallOptions} from 'esinstall';
+import type {OneToManyMap} from './commands/dev';
 import type * as http from 'http';
+import { EsmHmrEngine } from './hmr-server-engine';
 
 // RawSourceMap is inlined here for bundle purposes.
 // import type {RawSourceMap} from 'source-map';
@@ -36,6 +38,7 @@ export interface ServerRuntimeModule<T> {
 
 export interface LoadResult<T = Buffer | string> {
   contents: T;
+  imports: string[];
   originalFileLoc: string | null;
   contentType: string | false;
   checkStale?: () => Promise<void>;
@@ -44,6 +47,7 @@ export interface LoadResult<T = Buffer | string> {
 export type OnFileChangeCallback = ({filePath: string}) => any;
 export interface SnowpackDevServer {
   port: number;
+  hmrEngine: EsmHmrEngine;
   loadUrl: {
     (
       reqUrl: string,
@@ -366,7 +370,7 @@ export interface PackageSource {
     spec: string,
     isSSR: boolean,
     options: {config: SnowpackConfig; lockfile: LockfileManifest | null},
-  ): Promise<Buffer | string>;
+  ): Promise<{contents: Buffer | string, imports: string[]}>;
   /** Resolve a package import to URL (ex: "react" -> "/pkg/react") */
   resolvePackageImport(source: string, spec: string, config: SnowpackConfig): Promise<string>;
   /** Modify the build install config for optimized build install. */

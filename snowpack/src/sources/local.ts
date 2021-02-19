@@ -60,7 +60,7 @@ export function getLinkedUrl(builtUrl: string) {
  * interacts with esinstall and your locally installed dependencies.
  */
 export default {
-  async load(id: string, isSSR: boolean): Promise<Buffer | string> {
+  async load(id: string, isSSR: boolean): Promise<{contents: Buffer | string, imports: string[]}> {
     const packageImport = allPackageImports[id];
     const {loc, entrypoint, packageName, packageVersion} = packageImport;
     let {installDest} = packageImport;
@@ -72,49 +72,56 @@ export default {
     // cleared out the directory that you're trying to read out of.
     await inProgressBuilds.onIdle();
     let packageCode = await fs.readFile(loc, 'utf8');
+    const imports: string[] = [];
     const packageImportMap = JSON.parse(
       await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'),
     );
+    const resolveImport = async (spec): Promise<string> => {
+      if (isRemoteUrl(spec)) {
+        return spec;
+      }
+      if (spec.startsWith('/')) {
+        return spec;
+      }
+      // These are a bit tricky: relative paths within packages always point to
+      // relative files within the built package (ex: 'pkg/common/XXX-hash.js`).
+      // We resolve these to a new kind of "internal" import URL that's different
+      // from the normal, flattened URL for public imports.
+      if (spec.startsWith('./') || spec.startsWith('../')) {
+        const newLoc = path.resolve(path.dirname(loc), spec);
+        const resolvedSpec = path.relative(installDest, newLoc);
+        const publicImportEntry = Object.entries(packageImportMap.imports).find(
+          ([, v]) => v === './' + resolvedSpec,
+        );
+        // If this matches the destination of a public package import, resolve to it.
+        if (publicImportEntry) {
+          spec = publicImportEntry[0];
+          return await this.resolvePackageImport(entrypoint, spec, config);
+        }
+        // Otherwise, create a relative import ID for the internal file.
+        const relativeImportId = path.join(`${packageName}.v${packageVersion}`, resolvedSpec);
+        allPackageImports[relativeImportId] = {
+          entrypoint: path.join(installDest, 'package.json'),
+          loc: newLoc,
+          installDest,
+          packageVersion,
+          packageName,
+        };
+        return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', relativeImportId);
+      }
+      // Otherwise, resolve this specifier as an external package.
+      return await this.resolvePackageImport(entrypoint, spec, config);
+    };
+
     packageCode = await transformFileImports(
       {type: path.extname(loc), contents: packageCode},
-      async (spec): Promise<string> => {
-        if (isRemoteUrl(spec)) {
-          return spec;
-        }
-        if (spec.startsWith('/')) {
-          return spec;
-        }
-        // These are a bit tricky: relative paths within packages always point to
-        // relative files within the built package (ex: 'pkg/common/XXX-hash.js`).
-        // We resolve these to a new kind of "internal" import URL that's different
-        // from the normal, flattened URL for public imports.
-        if (spec.startsWith('./') || spec.startsWith('../')) {
-          const newLoc = path.resolve(path.dirname(loc), spec);
-          const resolvedSpec = path.relative(installDest, newLoc);
-          const publicImportEntry = Object.entries(packageImportMap.imports).find(
-            ([, v]) => v === './' + resolvedSpec,
-          );
-          // If this matches the destination of a public package import, resolve to it.
-          if (publicImportEntry) {
-            spec = publicImportEntry[0];
-            return await this.resolvePackageImport(entrypoint, spec, config);
-          }
-          // Otherwise, create a relative import ID for the internal file.
-          const relativeImportId = path.join(`${packageName}.v${packageVersion}`, resolvedSpec);
-          allPackageImports[relativeImportId] = {
-            entrypoint: path.join(installDest, 'package.json'),
-            loc: newLoc,
-            installDest,
-            packageVersion,
-            packageName,
-          };
-          return path.posix.join(config.buildOptions.metaUrlPath, 'pkg', relativeImportId);
-        }
-        // Otherwise, resolve this specifier as an external package.
-        return await this.resolvePackageImport(entrypoint, spec, config);
-      },
+      async spec => {
+        const resolvedSpec = await resolveImport(spec);
+        imports.push(path.resolve(path.posix.join(config.buildOptions.metaUrlPath, 'pkg', id), resolvedSpec));
+        return resolvedSpec;
+      }
     );
-    return packageCode;
+    return {contents: packageCode, imports};
   },
 
   modifyBuildInstallOptions({installOptions, config}) {
@@ -268,10 +275,10 @@ export default {
       for (const imp of await scanCodeImportsExports(code)) {
         const spec = code.substring(imp.s, imp.e);
         if (isRemoteUrl(spec)) {
-          return;
+          continue;
         }
         if (spec.startsWith('/') || spec.startsWith('./') || spec.startsWith('../')) {
-          return;
+          continue;
         }
         packageImports.add(spec);
       }

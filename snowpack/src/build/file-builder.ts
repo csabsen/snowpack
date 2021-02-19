@@ -18,7 +18,14 @@ import {
   SnowpackConfig,
 } from '../types';
 import {isRemoteUrl, relativeURL, replaceExtension} from '../util';
-import {wrapHtmlResponse, wrapImportMeta, wrapImportProxy} from './build-import-proxy';
+import {
+  wrapHtmlResponse,
+  wrapImportMeta,
+  wrapImportProxy,
+  getMetaUrlPath,
+  SRI_CLIENT_HMR_SNOWPACK,
+  SRI_ERROR_HMR_SNOWPACK,
+} from './build-import-proxy';
 import {buildFile} from './build-pipeline';
 import {getUrlsForFile} from './file-urls';
 import {createImportResolver} from './import-resolver';
@@ -31,7 +38,7 @@ import {createImportResolver} from './import-resolver';
 export class FileBuilder {
   buildOutput: SnowpackBuildMap = {};
   resolvedOutput: SnowpackBuildMap = {};
-  proxyImports: string[] = [];
+  imports: string[] = [];
 
   isHMR: boolean;
   isSSR: boolean;
@@ -69,7 +76,6 @@ export class FileBuilder {
     this.config = config;
     this.hmrEngine = hmrEngine || null;
     this.urls = getUrlsForFile(loc, config);
-    console.log(this.urls);
   }
 
   private verifyRequestFromBuild(type: string): SnowpackBuiltFile {
@@ -87,8 +93,8 @@ export class FileBuilder {
   async resolveImports(hmrParam?: string | false, importMap?: ImportMap): Promise<void> {
     const urlPathDirectory = path.posix.dirname(this.urls[0]!);
     const pkgSource = getPackageSource(this.config.packageOptions.source);
+    this.imports = [];
     for (const [type, outputResult] of Object.entries(this.buildOutput)) {
-      console.log('OKAY', this.loc, type);
       if (!(type === '.js' || type === '.html' || type === '.css')) {
         continue;
       }
@@ -106,15 +112,17 @@ export class FileBuilder {
         )}`;
         contents = `import '${relativeCssImport}';\n` + contents;
       }
+      // Finalize the response
+      contents = this.finalizeResult(type, contents);
+      // resolve all imports
       const resolveImportSpecifier = createImportResolver({
         fileLoc: this.loc,
         config: this.config,
       });
-      contents = await transformFileImports({type, contents}, async (spec) => {
+      const resolveImport = async (spec) => {
         // Try to resolve the specifier to a known URL in the project
         let resolvedImportUrl = resolveImportSpecifier(spec);
         // Handle a package import
-        console.log(spec, importMap);
         if (!resolvedImportUrl && importMap) {
           if (importMap.imports[spec]) {
             const PACKAGE_PATH_PREFIX = path.posix.join(
@@ -128,6 +136,7 @@ export class FileBuilder {
         }
         if (!resolvedImportUrl) {
           resolvedImportUrl = await pkgSource.resolvePackageImport(this.loc, spec, this.config);
+          console.log('ATTEMPTED TO RESOLVE', spec, resolvedImportUrl);
         }
         // Handle a package import that couldn't be resolved
         if (!resolvedImportUrl) {
@@ -147,7 +156,6 @@ export class FileBuilder {
         const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs';
         const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
         if (isProxyImport) {
-          this.proxyImports.push(path.posix.resolve(urlPathDirectory, resolvedImportUrl));
           resolvedImportUrl = resolvedImportUrl + '.proxy.js';
         }
 
@@ -161,7 +169,26 @@ export class FileBuilder {
           resolvedImportUrl = './' + resolvedImportUrl;
         }
         return resolvedImportUrl;
+      };
+
+      contents = await transformFileImports({type, contents}, async (spec) => {
+        const resolvedImport = await resolveImport(spec);
+        console.log('ADD IMPORT', this.urls[0]!, type, resolvedImport);
+        this.imports.push(path.resolve(urlPathDirectory, resolvedImport));
+        return resolvedImport;
       });
+
+      // This is a hack since we can't currently scan "script" `src=` tags as imports.
+      // Either move these to inline JavaScript in the script body, or add support for 
+      // `script.src=` and `link.href` scanning & resolving in transformFileImports().
+      if (type === '.html') {
+        if (contents.includes(SRI_CLIENT_HMR_SNOWPACK)) {
+          this.imports.push(getMetaUrlPath('hmr-client.js', this.config));
+        }
+        if (contents.includes(SRI_ERROR_HMR_SNOWPACK)) {
+          this.imports.push(getMetaUrlPath('hmr-error-overlay.js', this.config));
+        }
+      }
 
       if (type === '.js' && hmrParam) {
         contents = await transformEsmImports(contents as string, (imp) => {
@@ -218,7 +245,6 @@ export class FileBuilder {
     try {
       this.resolvedOutput = {};
       this.buildOutput = await fileBuilderPromise;
-      console.log(this.buildOutput);
       for (const [outputKey, {code, map}] of Object.entries(this.buildOutput)) {
         this.resolvedOutput[outputKey] = {code, map};
       }
@@ -227,14 +253,12 @@ export class FileBuilder {
     }
   }
 
-  getResult(type: string): string | Buffer {
-    const {code /*, map */} = this.verifyRequestFromBuild(type);
-    let finalResponse = code;
+  private finalizeResult(type: string, content: string): string {
     // Wrap the response.
     switch (type) {
       case '.html': {
-        finalResponse = wrapHtmlResponse({
-          code: finalResponse as string,
+        content = wrapHtmlResponse({
+          code: content as string,
           hmr: this.isHMR,
           hmrPort: this.hmrEngine ? this.hmrEngine.port : undefined,
           isDev: true,
@@ -252,8 +276,8 @@ export class FileBuilder {
           // if (isProxyModule) {
           //   code = await wrapImportProxy({url: reqPath, code, hmr: isHMR, config});
           // } else {
-          finalResponse = wrapImportMeta({
-            code: finalResponse as string,
+          content = wrapImportMeta({
+            code: content as string,
             env: true,
             hmr: this.isHMR,
             config: this.config,
@@ -267,7 +291,13 @@ export class FileBuilder {
     }
 
     // Return the finalized response.
-    return finalResponse;
+    return content;
+  }
+
+  getResult(type: string): string | Buffer {
+    const {code /*, map */} = this.verifyRequestFromBuild(type);
+    // Return the finalized response.
+    return code;
   }
 
   async getAllResults(): Promise<Record<string, string | Buffer>> {

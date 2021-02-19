@@ -34,9 +34,9 @@ import {
 import {hasExtension, HMR_CLIENT_CODE, HMR_OVERLAY_CODE, openInBrowser} from '../util';
 import {getPort, getServerInfoMessage, paintDashboard, paintEvent} from './paint';
 
-class OneToManyMap {
-  private keyToValue = new Map<string, string[]>();
-  private valueToKey = new Map<string, string>();
+export class OneToManyMap {
+  readonly keyToValue = new Map<string, string[]>();
+  readonly valueToKey = new Map<string, string>();
   add(key: string, _value: string | string[]) {
     const value = Array.isArray(_value) ? _value : [_value];
     this.keyToValue.set(key, value);
@@ -412,6 +412,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     if (reqPath === getMetaUrlPath('/hmr-client.js', config)) {
       return {
         contents: encodeResponse(HMR_CLIENT_CODE, encoding),
+        imports: [],
         originalFileLoc: null,
         contentType: 'application/javascript',
       };
@@ -419,6 +420,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     if (reqPath === getMetaUrlPath('/hmr-error-overlay.js', config)) {
       return {
         contents: encodeResponse(HMR_OVERLAY_CODE, encoding),
+        imports: [],
         originalFileLoc: null,
         contentType: 'application/javascript',
       };
@@ -426,15 +428,17 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     if (reqPath === getMetaUrlPath('/env.js', config)) {
       return {
         contents: encodeResponse(generateEnvModule({mode: 'development', isSSR}), encoding),
+        imports: [],
         originalFileLoc: null,
         contentType: 'application/javascript',
       };
     }
     if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
       const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
-      const loadedModule = await pkgSource.load(webModuleUrl, isSSR, commandOptions);
+    const loadedModule = await pkgSource.load(webModuleUrl, isSSR, commandOptions);
       return {
-        contents: encodeResponse(loadedModule, encoding),
+      imports: loadedModule.imports,
+      contents: encodeResponse(loadedModule.contents, encoding),
         originalFileLoc: null,
         contentType: mime.lookup(reqPath) || 'application/javascript',
       };
@@ -513,7 +517,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     // 1. Check the hot build cache. If it's already found, then just serve it.
     const cacheKey = getCacheKey(fileLoc, {isSSR, env: process.env.NODE_ENV});
     let fileBuilder: FileBuilder | undefined = inMemoryBuildCache.get(cacheKey);
-
     if (!fileBuilder) {
       fileBuilder = new FileBuilder({
         loc: fileLoc,
@@ -565,6 +568,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
 
     return {
+      imports: fileBuilder.imports,
       contents: encodeResponse(finalizedResponse, encoding),
       originalFileLoc: fileLoc,
       contentType: mime.lookup(responseType),
@@ -701,7 +705,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       hmrEngine.broadcastMessage({type: 'update', url, bubbled: isBubbled});
     }
     visited.add(url);
-    console.log('CHECK', url, node && node.dependents);
     if (node && node.isHmrAccepted) {
       // Found a boundary, no bubbling needed
     } else if (node && node.dependents.size > 0) {
@@ -742,7 +745,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       virtualCssFileUrl.includes(path.basename(fileLoc)) &&
       hmrEngine.getEntry(`${virtualCssFileUrl}.proxy.js`);
     if (virtualNode) {
-      console.log('REPLACE', virtualNode);
       hmrEngine.markEntryForReplacement(virtualNode, true);
     }
 
@@ -792,9 +794,8 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
   // Watch src files
   async function onWatchEvent(fileLoc: string) {
     logger.info(colors.cyan('File changed...'));
-    onFileChangeCallback({filePath: fileLoc});
+    await onFileChangeCallback({filePath: fileLoc});
     const updatedUrls = getUrlsForFile(fileLoc, config);
-    console.log('updatedUrls', updatedUrls);
     if (updatedUrls) {
       handleHmrUpdate(fileLoc, updatedUrls[0]);
       knownETags.delete(updatedUrls[0]);
@@ -830,6 +831,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
 
   const sp = {
     port,
+    hmrEngine,
     loadUrl,
     handleRequest,
     sendResponseFile,

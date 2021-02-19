@@ -6,8 +6,8 @@ import {SnowpackConfig} from '../types';
 import {appendHtmlToHead, hasExtension, HMR_CLIENT_CODE, HMR_OVERLAY_CODE} from '../util';
 import {generateSRI} from './import-sri';
 
-const SRI_CLIENT_HMR_SNOWPACK = generateSRI(Buffer.from(HMR_CLIENT_CODE));
-const SRI_ERROR_HMR_SNOWPACK = generateSRI(Buffer.from(HMR_OVERLAY_CODE));
+export const SRI_CLIENT_HMR_SNOWPACK = generateSRI(Buffer.from(HMR_CLIENT_CODE));
+export const SRI_ERROR_HMR_SNOWPACK = generateSRI(Buffer.from(HMR_OVERLAY_CODE));
 
 const importMetaRegex = /import\s*\.\s*meta/;
 

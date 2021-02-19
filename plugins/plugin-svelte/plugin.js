@@ -99,7 +99,7 @@ module.exports = function plugin(snowpackConfig, pluginOptions = {}) {
         generate: isSSR ? 'ssr' : 'dom',
         css: isPackage ? true : false,
         ...compilerOptions, // Note(drew) should take precedence over generate above
-        dev: isDev,
+        dev: isHmrEnabled || isDev,
         outputFilename: filePath,
         filename: filePath,
       };

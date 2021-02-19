@@ -811,7 +811,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
   });
 
   // Open the user's browser (ignore if failed)
-  if (open !== 'none') {
+  if (open && open !== 'none') {
     await openInBrowser(protocol, hostname, port, open).catch((err) => {
       logger.debug(`Browser open error: ${err}`);
     });
@@ -885,6 +885,11 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
 
 export async function command(commandOptions: CommandOptions) {
   try {
+    // Set some CLI-focused defaults
+    commandOptions.config.devOptions.output =
+      commandOptions.config.devOptions.output || 'dashboard';
+    commandOptions.config.devOptions.open = commandOptions.config.devOptions.open || 'default';
+    // Start the server
     const pkgSource = getPackageSource(commandOptions.config.packageOptions.source);
     await pkgSource.prepare(commandOptions);
     await startServer(commandOptions);

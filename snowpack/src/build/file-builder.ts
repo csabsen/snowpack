@@ -86,7 +86,7 @@ export class FileBuilder {
     const urlPathDirectory = path.posix.dirname(this.urls[0]!);
     const pkgSource = getPackageSource(this.config.packageOptions.source);
     this.imports = [];
-    for (const [type, outputResult] of Object.entries(this.buildOutput)) {
+        for (const [type, outputResult] of Object.entries(this.buildOutput)) {
       if (!(type === '.js' || type === '.html' || type === '.css')) {
         continue;
       }
@@ -148,7 +148,7 @@ export class FileBuilder {
         const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs';
         const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
         if (isAbsoluteUrlPath) {
-            if (isProxyImport) {
+            if (this.config.buildOptions.resolveProxyImports && isProxyImport) {
                 resolvedImportUrl = resolvedImportUrl + '.proxy.js';
             }
         }

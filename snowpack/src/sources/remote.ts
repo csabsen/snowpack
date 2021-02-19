@@ -98,7 +98,7 @@ export default {
     spec: string,
     isSSR: boolean,
     {config, lockfile}: {config: SnowpackConfig; lockfile: LockfileManifest | null},
-  ): Promise<string | Buffer> {
+  ) {
     let body: Buffer;
     if (
       spec.startsWith('-/') ||
@@ -151,13 +151,16 @@ export default {
     }
     const ext = path.extname(spec);
     if (!ext || isJavaScript(spec)) {
-      return body
-        .toString()
-        .replace(/(from|import) \'\//g, `$1 '${config.buildOptions.metaUrlPath}/pkg/`)
-        .replace(/(from|import) \"\//g, `$1 "${config.buildOptions.metaUrlPath}/pkg/`);
+      return {
+        contents: body
+          .toString()
+          .replace(/(from|import) \'\//g, `$1 '${config.buildOptions.metaUrlPath}/pkg/`)
+          .replace(/(from|import) \"\//g, `$1 "${config.buildOptions.metaUrlPath}/pkg/`),
+        imports: [],
+      };
     }
 
-    return body;
+    return {contents: body, imports: []};
   },
 
   // TODO: Remove need for lookup URLs

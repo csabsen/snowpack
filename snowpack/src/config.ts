@@ -35,8 +35,6 @@ const DEFAULT_CONFIG: SnowpackUserConfig = {
     secure: false,
     hostname: 'localhost',
     port: 8080,
-    open: 'default',
-    output: 'dashboard',
     hmrDelay: 0,
     hmrPort: undefined,
     hmrErrorOverlay: true,
@@ -50,6 +48,7 @@ const DEFAULT_CONFIG: SnowpackUserConfig = {
     watch: false,
     htmlFragments: false,
     ssr: false,
+    resolveProxyImports: true,
   },
   testOptions: {
     files: ['__tests__/**/*', '**/*.@(spec|test).*'],
@@ -105,7 +104,6 @@ const configSchema = {
       properties: {
         secure: {type: 'boolean'},
         port: {type: 'number'},
-        bundle: {type: 'boolean'},
         open: {type: 'string'},
         output: {type: 'string', enum: ['stream', 'dashboard']},
         hmr: {type: 'boolean'},
@@ -171,7 +169,15 @@ const configSchema = {
     },
     optimize: {
       type: ['object'],
-      properties: {},
+      properties: {
+        preload: {type: 'boolean'},
+        bundle: {type: 'boolean'},
+        splitting: {type: 'boolean'},
+        treeshake: {type: 'boolean'},
+        manifest: {type: 'boolean'},
+        minify: {type: 'boolean'},
+        target: {type: 'string'},
+      },
     },
     proxy: {
       type: 'object',
@@ -235,6 +241,7 @@ export function expandCliFlags(flags: CLIFlags): SnowpackUserConfig {
     logger.error(`Unknown CLI flag: "${flag}"`);
     process.exit(1);
   }
+  console.log(result);
   if (result.packageOptions.env) {
     result.packageOptions.env = result.packageOptions.env.reduce((acc, id) => {
       const index = id.indexOf('=');
@@ -402,6 +409,7 @@ function normalizeConfig(_config: SnowpackUserConfig): SnowpackConfig {
   );
   config.mount = normalizeMount(config);
   config.routes = normalizeRoutes(config.routes);
+  console.log(config.optimize);
   if (config.optimize && JSON.stringify(config.optimize) !== '{}') {
     config.optimize = {
       entrypoints: config.optimize.entrypoints ?? 'auto',

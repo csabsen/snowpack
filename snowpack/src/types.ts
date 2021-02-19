@@ -108,7 +108,7 @@ export type SnowpackBuildResultFileManifest = Record<
 >;
 
 export interface SnowpackBuildResult {
-  result: SnowpackBuildResultFileManifest;
+  // result: SnowpackBuildResultFileManifest;
   onFileChange: (callback: OnFileChangeCallback) => void;
   shutdown(): Promise<void>;
 }
@@ -274,8 +274,8 @@ export interface SnowpackConfig {
     secure: boolean;
     hostname: string;
     port: number;
-    open: string;
-    output: 'stream' | 'dashboard';
+    open?: string;
+    output?: 'stream' | 'dashboard';
     hmr?: boolean;
     hmrDelay: number;
     hmrPort: number | undefined;
@@ -292,6 +292,7 @@ export interface SnowpackConfig {
     jsxFactory: string | undefined;
     jsxFragment: string | undefined;
     ssr: boolean;
+    resolveProxyImports: boolean;
   };
   testOptions: {
     files: string[];

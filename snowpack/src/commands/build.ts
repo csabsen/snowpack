@@ -10,7 +10,7 @@ import {runBuiltInOptimize} from '../build/optimize';
 import {logger} from '../logger';
 import {installPackages} from '../sources/local-install';
 import {getPackageSource} from '../sources/util';
-import {CommandOptions, OnFileChangeCallback, SnowpackConfig} from '../types';
+import {CommandOptions, OnFileChangeCallback, SnowpackBuildResult, SnowpackConfig} from '../types';
 import {deleteFromBuildSafe} from '../util';
 import {startServer} from './dev';
 
@@ -72,21 +72,12 @@ async function installOptimizedDependencies(
   return installResult;
 }
 
-// export async function build(commandOptions: CommandOptions): Promise<SnowpackBuildResult> {
-const onWatchEvent: any = () => {}; // TODO: remove
-export async function build(commandOptions: CommandOptions): Promise<any> {
+export async function build(commandOptions: CommandOptions): Promise<SnowpackBuildResult> {
   const {config} = commandOptions;
-  const isDev = !!config.buildOptions.watch;
+  config.buildOptions.resolveProxyImports = !(config.optimize?.bundle);
+  console.log('config.optimize', config.optimize);
   const isSSR = !!config.buildOptions.ssr;
   const isHMR = getIsHmrEnabled(config);
-
-  // Fill in any command-specific plugin methods.
-  // NOTE: markChanged only needed during dev, but may not be true for all.
-  if (isDev) {
-    for (const p of config.plugins) {
-      p.markChanged = (fileLoc) => onWatchEvent(fileLoc) || undefined;
-    }
-  }
 
   const buildDirectoryLoc = config.buildOptions.out;
   if (config.buildOptions.clean) {
@@ -166,9 +157,9 @@ export async function build(commandOptions: CommandOptions): Promise<any> {
       isResolve: true,
       importMap: installResult.importMap,
     });
+    
     await mkdirp(path.dirname(path.join(buildDirectoryLoc, fileUrl)));
     await fs.writeFile(path.join(buildDirectoryLoc, fileUrl), result.contents);
-    console.log('IMPORTS', result.imports);
     for (const importedUrl of result.imports) {
       if (!importedUrl.startsWith('/')) {
         allBareModuleSpecifiers.add(importedUrl);

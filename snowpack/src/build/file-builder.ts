@@ -42,8 +42,6 @@ export class FileBuilder {
 
   isHMR: boolean;
   isSSR: boolean;
-  isStatic: boolean;
-  isResolve: boolean;
   buildPromise: Promise<SnowpackBuildMap> | undefined;
 
   readonly loc: string;
@@ -55,24 +53,18 @@ export class FileBuilder {
     loc,
     isHMR,
     isSSR,
-    isStatic,
-    isResolve,
     config,
     hmrEngine,
   }: {
     loc: string;
     isHMR: boolean;
     isSSR: boolean;
-    isStatic: boolean;
-    isResolve: boolean;
     config: SnowpackConfig;
     hmrEngine?: EsmHmrEngine | null;
   }) {
     this.loc = loc;
     this.isHMR = isHMR;
     this.isSSR = isSSR;
-    this.isStatic = isStatic;
-    this.isResolve = isResolve;
     this.config = config;
     this.hmrEngine = hmrEngine || null;
     this.urls = getUrlsForFile(loc, config);
@@ -90,7 +82,7 @@ export class FileBuilder {
    * Resolve Imports: Resolved imports are based on the state of the file
    * system, so they can't be cached long-term with the build.
    */
-  async resolveImports(hmrParam?: string | false, importMap?: ImportMap): Promise<void> {
+  async resolveImports(isResolve: boolean, hmrParam?: string | false, importMap?: ImportMap): Promise<void> {
     const urlPathDirectory = path.posix.dirname(this.urls[0]!);
     const pkgSource = getPackageSource(this.config.packageOptions.source);
     this.imports = [];
@@ -122,6 +114,9 @@ export class FileBuilder {
       const resolveImport = async (spec) => {
         // Try to resolve the specifier to a known URL in the project
         let resolvedImportUrl = resolveImportSpecifier(spec);
+        if (!isResolve) {
+            return resolvedImportUrl || spec;
+        }
         // Handle a package import
         if (!resolvedImportUrl && importMap) {
           if (importMap.imports[spec]) {
@@ -134,54 +129,42 @@ export class FileBuilder {
           // TODO: Not getting reported during build?
           throw new Error(`Unexpected: spec ${spec} not included in import map.`);
         }
+        // Ignore packages marked as external
+        if (this.config.packageOptions.external?.includes(spec)) {
+          return spec;
+        }
         if (!resolvedImportUrl) {
           resolvedImportUrl = await pkgSource.resolvePackageImport(this.loc, spec, this.config);
           console.log('ATTEMPTED TO RESOLVE', spec, resolvedImportUrl);
         }
-        // Handle a package import that couldn't be resolved
-        if (!resolvedImportUrl) {
-          return spec;
-        }
-        // Ignore "http://*" imports
-        if (isRemoteUrl(resolvedImportUrl)) {
-          return resolvedImportUrl;
-        }
-        // Ignore packages marked as external
-        if (this.config.packageOptions.external?.includes(resolvedImportUrl)) {
-          return spec;
-        }
+        return resolvedImportUrl || spec;
+      };
+
+      contents = await transformFileImports({type, contents}, async (spec) => {
+        let resolvedImportUrl = await resolveImport(spec);
 
         // Handle normal "./" & "../" import specifiers
         const importExtName = path.posix.extname(resolvedImportUrl);
         const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs';
         const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
-        if (isProxyImport) {
-          resolvedImportUrl = resolvedImportUrl + '.proxy.js';
+        if (isAbsoluteUrlPath) {
+            if (isProxyImport) {
+                resolvedImportUrl = resolvedImportUrl + '.proxy.js';
+            }
         }
-
-        // When dealing with an absolute import path, we need to honor the baseUrl
-        // proxy modules may attach code to the root HTML (like style) so don't resolve
-        if (isAbsoluteUrlPath /* && !isProxyModule */) {
-          resolvedImportUrl = relativeURL(urlPathDirectory, resolvedImportUrl);
-        }
-        // Make sure that a relative URL always starts with "./"
-        if (!resolvedImportUrl.startsWith('.') && !resolvedImportUrl.startsWith('/')) {
-          resolvedImportUrl = './' + resolvedImportUrl;
+        this.imports.push(resolvedImportUrl);
+        if (isAbsoluteUrlPath) {
+            // When dealing with an absolute import path, we need to honor the baseUrl
+            // proxy modules may attach code to the root HTML (like style) so don't resolve
+            resolvedImportUrl = relativeURL(urlPathDirectory, resolvedImportUrl);
         }
         return resolvedImportUrl;
-      };
-
-      contents = await transformFileImports({type, contents}, async (spec) => {
-        const resolvedImport = await resolveImport(spec);
-        console.log('ADD IMPORT', this.urls[0]!, type, resolvedImport);
-        this.imports.push(path.resolve(urlPathDirectory, resolvedImport));
-        return resolvedImport;
       });
 
       // This is a hack since we can't currently scan "script" `src=` tags as imports.
-      // Either move these to inline JavaScript in the script body, or add support for 
+      // Either move these to inline JavaScript in the script body, or add support for
       // `script.src=` and `link.href` scanning & resolving in transformFileImports().
-      if (type === '.html') {
+      if (type === '.html' && this.isHMR) {
         if (contents.includes(SRI_CLIENT_HMR_SNOWPACK)) {
           this.imports.push(getMetaUrlPath('hmr-client.js', this.config));
         }
@@ -227,11 +210,19 @@ export class FileBuilder {
    * build. A Build Map is used because one source file can result in multiple
    * built files (Example: .svelte -> .js & .css).
    */
-  async build() {
+  async build(isStatic: boolean) {
     if (this.buildPromise) {
       return this.buildPromise;
     }
     const fileBuilderPromise = (async () => {
+      if (isStatic) {
+        return {
+          [path.extname(this.loc)]: {
+            code: await fs.readFile(this.loc),
+            map: undefined,
+          },
+        };
+      }
       const builtFileOutput = await buildFile(url.pathToFileURL(this.loc), {
         config: this.config,
         isDev: true,

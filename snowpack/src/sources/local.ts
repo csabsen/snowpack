@@ -62,6 +62,7 @@ export function getLinkedUrl(builtUrl: string) {
 export default {
   async load(id: string, isSSR: boolean): Promise<{contents: Buffer | string, imports: string[]}> {
     const packageImport = allPackageImports[id];
+    console.log(id, allPackageImports);
     const {loc, entrypoint, packageName, packageVersion} = packageImport;
     let {installDest} = packageImport;
     if (isSSR && existsSync(installDest + '-ssr')) {
@@ -124,7 +125,8 @@ export default {
     return {contents: packageCode, imports};
   },
 
-  modifyBuildInstallOptions({installOptions, config}) {
+  modifyBuildInstallOptions({installOptions, config: _config}) {
+    config = config || _config;
     if (config.packageOptions.source !== 'local') {
       return installOptions;
     }

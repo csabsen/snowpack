@@ -2,38 +2,17 @@ import {promises as fs} from 'fs';
 import glob from 'glob';
 import * as colors from 'kleur/colors';
 import mkdirp from 'mkdirp';
-import PQueue from 'p-queue';
 import path from 'path';
 import {performance} from 'perf_hooks';
-import url from 'url';
-import {generateEnvModule, wrapImportProxy} from '../build/build-import-proxy';
 import {runPipelineCleanupStep, runPipelineOptimizeStep} from '../build/build-pipeline';
-import {FileBuilder} from '../build/file-builder';
-import {getMountEntryForFile, getUrlsForFile, getUrlsForFileMount} from '../build/file-urls';
+import {getUrlsForFile} from '../build/file-urls';
 import {runBuiltInOptimize} from '../build/optimize';
-import {EsmHmrEngine} from '../hmr-server-engine';
 import {logger} from '../logger';
-import {getInstallTargets} from '../scan-imports';
 import {installPackages} from '../sources/local-install';
 import {getPackageSource} from '../sources/util';
-import {
-  CommandOptions,
-  OnFileChangeCallback,
-  SnowpackBuildResult,
-  SnowpackBuildResultFileManifest,
-  SnowpackConfig,
-  SnowpackSourceFile,
-} from '../types';
-import {
-  deleteFromBuildSafe,
-  HMR_CLIENT_CODE,
-  HMR_OVERLAY_CODE,
-  isFsEventsEnabled,
-  readFile,
-} from '../util';
+import {CommandOptions, OnFileChangeCallback, SnowpackConfig} from '../types';
+import {deleteFromBuildSafe} from '../util';
 import {startServer} from './dev';
-
-const CONCURRENT_WORKERS = require('os').cpus().length;
 
 function getIsHmrEnabled(config: SnowpackConfig) {
   return config.buildOptions.watch && !!config.devOptions.hmr;
@@ -63,7 +42,7 @@ async function removeEmptyFolders(directoryLoc: string): Promise<boolean> {
 }
 
 async function installOptimizedDependencies(
-  scannedFiles: SnowpackSourceFile[],
+  installTargets: string[],
   installDest: string,
   commandOptions: CommandOptions,
 ) {
@@ -76,20 +55,12 @@ async function installOptimizedDependencies(
       : commandOptions.config.optimize?.treeshake !== false,
   };
 
-  // start
-  const installStart = performance.now();
-  logger.info(colors.yellow('! building dependencies...'));
   const pkgSource = getPackageSource(commandOptions.config.packageOptions.source);
   const installOptions = pkgSource.modifyBuildInstallOptions({
     installOptions: baseInstallOptions,
     config: commandOptions.config,
     lockfile: commandOptions.lockfile,
   });
-
-  // 1. Scan imports from your final built JS files.
-  // Unlike dev (where we scan from source code) the built output guarantees that we
-  // will can scan all used entrypoints. Set to `[]` to improve tree-shaking performance.
-  const installTargets = await getInstallTargets(commandOptions.config, [], scannedFiles);
   // 2. Install dependencies, based on the scan of your final build.
   const installResult = await installPackages({
     config: commandOptions.config,
@@ -98,13 +69,6 @@ async function installOptimizedDependencies(
     installTargets,
     installOptions,
   });
-  // finish
-  const installEnd = performance.now();
-  logger.info(
-    `${colors.green(`✔`) + ' dependencies ready!'} ${colors.dim(
-      `[${((installEnd - installStart) / 1000).toFixed(2)}s]`,
-    )}`,
-  );
   return installResult;
 }
 
@@ -114,6 +78,7 @@ export async function build(commandOptions: CommandOptions): Promise<any> {
   const {config} = commandOptions;
   const isDev = !!config.buildOptions.watch;
   const isSSR = !!config.buildOptions.ssr;
+  const isHMR = getIsHmrEnabled(config);
 
   // Fill in any command-specific plugin methods.
   // NOTE: markChanged only needed during dev, but may not be true for all.
@@ -124,18 +89,10 @@ export async function build(commandOptions: CommandOptions): Promise<any> {
   }
 
   const buildDirectoryLoc = config.buildOptions.out;
-  // const internalFilesBuildLoc = path.join(buildDirectoryLoc, config.buildOptions.metaUrlPath);
   if (config.buildOptions.clean) {
     deleteFromBuildSafe(buildDirectoryLoc, config);
   }
   mkdirp.sync(buildDirectoryLoc);
-  // mkdirp.sync(internalFilesBuildLoc);
-
-  // NEW BUILD:
-  // √ run pkgsource.prepare()
-  // start up the dev server (or, start up a workflow just like dev)
-  // start hitting it with requests (one for every source file)
-  // collect all imports (if proxy, add it to the build)
 
   const devServer = await startServer(commandOptions);
   console.log('ONWARD!');
@@ -153,27 +110,25 @@ export async function build(commandOptions: CommandOptions): Promise<any> {
     }
   }
 
+  const allBareModuleSpecifiers = new Set<string>();
   const allFileUrlsUnique = new Set(allFileUrls);
-  const allFileUrlsToProcess = [...allFileUrlsUnique];
+  let allFileUrlsToProcess = [...allFileUrlsUnique];
 
   logger.info(colors.yellow('! building files...'));
   const buildStart = performance.now();
   while (allFileUrlsToProcess.length > 0) {
     const fileUrl = allFileUrlsToProcess.pop()!;
-    console.log('POP', fileUrl);
-    const result = await devServer.loadUrl(fileUrl, {isSSR});
-    await mkdirp(path.dirname(path.join(buildDirectoryLoc, fileUrl)));
-    await fs.writeFile(path.join(buildDirectoryLoc, fileUrl), result.contents);
-    console.log('IMPORTS', result.imports);
+    const result = await devServer.loadUrl(fileUrl, {isSSR, isHMR, isResolve: false});
     for (const importedUrl of result.imports) {
-      if (!allFileUrlsUnique.has(importedUrl)) {
+      if (!importedUrl.startsWith('/')) {
+        allBareModuleSpecifiers.add(importedUrl);
+      } else if (!allFileUrlsUnique.has(importedUrl)) {
         allFileUrlsUnique.add(importedUrl);
         allFileUrlsToProcess.push(importedUrl);
-        console.log('PUSH', importedUrl);
       }
     }
   }
-
+  console.log('allBareModuleSpecifiers', allBareModuleSpecifiers);
   const buildEnd = performance.now();
   logger.info(
     `${colors.green('✔')} build complete ${colors.dim(
@@ -181,50 +136,56 @@ export async function build(commandOptions: CommandOptions): Promise<any> {
     )}`,
   );
 
-  // TODO: send isDev as an argument to startDevServer, use for runPlugin.run
-  // TODO: dev server needs a "don't resolve proxy" mode for imports when optimize = true
-  // TODO: tree-shaking mode for dependencies?
-  // TODO: do we still want to recreate buildResultManifest ? maybe just for source -> URL?
-    // const buildResultManifest: SnowpackBuildResultFileManifest = {};
+  logger.info(colors.yellow('! optimizing packages...'));
+  const packagesStart = performance.now();
+  const installDest = path.join(buildDirectoryLoc, config.buildOptions.metaUrlPath, 'pkg');
+  const installResult = await installOptimizedDependencies(
+    [...allBareModuleSpecifiers],
+    installDest,
+    commandOptions,
+  );
+  const packagesEnd = performance.now();
+  logger.info(
+    `${colors.green('✔')} packages optimized ${colors.dim(
+      `[${((packagesEnd - packagesStart) / 1000).toFixed(2)}s]`,
+    )}`,
+  );
 
-
-  // /** Install all needed dependencies, based on the master buildPipelineFiles list.  */
-  // async function installDependencies(scannedFiles: SnowpackSourceFile[]) {
-  //   const installDest = path.join(buildDirectoryLoc, config.buildOptions.metaUrlPath, 'pkg');
-  //   const installResult = await installOptimizedDependencies(
-  //     scannedFiles,
-  //     installDest,
-  //     commandOptions,
-  //   );
-  //   const allFiles = glob.sync(`**/*`, {
-  //     cwd: installDest,
-  //     absolute: true,
-  //     nodir: true,
-  //     dot: true,
-  //     follow: true,
-  //   });
-
-  //   if (!config.optimize?.bundle) {
-  //     for (const installedFileLoc of allFiles) {
-  //       if (
-  //         !installedFileLoc.endsWith('import-map.json') &&
-  //         path.extname(installedFileLoc) !== '.js'
-  //       ) {
-  //         const proxiedCode = await readFile(url.pathToFileURL(installedFileLoc));
-  //         const importProxyFileLoc = installedFileLoc + '.proxy.js';
-  //         const proxiedUrl = installedFileLoc.substr(buildDirectoryLoc.length).replace(/\\/g, '/');
-  //         const proxyCode = await wrapImportProxy({
-  //           url: proxiedUrl,
-  //           code: proxiedCode,
-  //           hmr: false,
-  //           config: config,
-  //         });
-  //         await fs.writeFile(importProxyFileLoc, proxyCode, 'utf8');
-  //       }
-  //     }
-  //   }
-  //   return installResult;
-  // }
+  logger.info(colors.yellow('! writing files...'));
+  const writeStart = performance.now();
+  allFileUrlsToProcess = [...allFileUrlsUnique];
+  while (allFileUrlsToProcess.length > 0) {
+    const fileUrl = allFileUrlsToProcess.pop()!;
+    console.log('POP', fileUrl);
+    if (fileUrl.startsWith(path.posix.join(config.buildOptions.metaUrlPath, 'pkg/'))) {
+      continue;
+    }
+    const result = await devServer.loadUrl(fileUrl, {
+      isSSR,
+      isHMR,
+      isResolve: true,
+      importMap: installResult.importMap,
+    });
+    await mkdirp(path.dirname(path.join(buildDirectoryLoc, fileUrl)));
+    await fs.writeFile(path.join(buildDirectoryLoc, fileUrl), result.contents);
+    console.log('IMPORTS', result.imports);
+    for (const importedUrl of result.imports) {
+      if (!importedUrl.startsWith('/')) {
+        allBareModuleSpecifiers.add(importedUrl);
+        console.log('BARE', importedUrl);
+      } else if (!allFileUrlsUnique.has(importedUrl)) {
+        allFileUrlsUnique.add(importedUrl);
+        allFileUrlsToProcess.push(importedUrl);
+        console.log('PUSH', importedUrl);
+      }
+    }
+  }
+  const writeEnd = performance.now();
+  logger.info(
+    `${colors.green('✔')} write complete ${colors.dim(
+      `[${((writeEnd - writeStart) / 1000).toFixed(2)}s]`,
+    )}`,
+  );
 
   // "--watch" mode - Start watching the file system.
   if (config.buildOptions.watch) {
@@ -234,11 +195,11 @@ export async function build(commandOptions: CommandOptions): Promise<any> {
       )}`,
     );
 
+    logger.info(colors.cyan('watching for changes...'));
+    let onFileChangeCallback: OnFileChangeCallback = () => {};
     devServer.onFileChange(async ({filePath}) => {
+      // First, do our own re-build logic
       allFileUrlsToProcess.push(...getUrlsForFile(filePath, config)!);
-      // const allFileUrlsUnique = new Set(allFileUrls);
-      // const allFileUrlsToProcess = [...allFileUrlsUnique];
-      // logger.info(colors.yellow('! building files...'));
       while (allFileUrlsToProcess.length > 0) {
         const fileUrl = allFileUrlsToProcess.pop()!;
         console.log('POP', fileUrl);
@@ -254,10 +215,9 @@ export async function build(commandOptions: CommandOptions): Promise<any> {
           }
         }
       }
+      // Then, call the user's onFileChange callback (if one provided)
+      await onFileChangeCallback({filePath});
     });
-    logger.info(colors.cyan('watching for changes...'));
-    let onFileChangeCallback: OnFileChangeCallback = () => {};
-
     return {
       onFileChange: (callback) => (onFileChangeCallback = callback),
       shutdown() {

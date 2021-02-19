@@ -53,9 +53,12 @@ export interface SnowpackDevServer {
       reqUrl: string,
       opt?:
         | {
-            isSSR?: boolean | undefined;
-            allowStale?: boolean | undefined;
+            isSSR?: boolean;
+            isHMR?: boolean;
+            isResolve?: boolean;
+            allowStale?: boolean;
             encoding?: undefined;
+            importMap?: ImportMap;
           }
         | undefined,
     ): Promise<LoadResult<Buffer | string>>;
@@ -63,16 +66,22 @@ export interface SnowpackDevServer {
       reqUrl: string,
       opt: {
         isSSR?: boolean;
+        isHMR?: boolean;
+        isResolve?: boolean;
         allowStale?: boolean;
         encoding: BufferEncoding;
+        importMap?: ImportMap;
       },
     ): Promise<LoadResult<string>>;
     (
       reqUrl: string,
       opt: {
         isSSR?: boolean;
+        isHMR?: boolean;
+        isResolve?: boolean;
         allowStale?: boolean;
         encoding: null;
+        importMap?: ImportMap;
       },
     ): Promise<LoadResult<Buffer>>;
   };

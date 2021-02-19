@@ -25,6 +25,7 @@ import {getPackageSource} from '../sources/util';
 import {createLoader as createServerRuntime} from '../ssr-loader';
 import {
   CommandOptions,
+  ImportMap,
   LoadResult,
   OnFileChangeCallback,
   RouteConfigObject,
@@ -300,7 +301,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
 
   logger.debug(`Using in-memory cache: ${fileToUrlMapping}`);
 
-  await pkgSource.prepare(commandOptions);
   const readCredentials = async (cwd: string) => {
     const [cert, key] = await Promise.all([
       fs.readFile(path.join(cwd, 'snowpack.crt')),
@@ -366,38 +366,72 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
   function loadUrl(
     reqUrl: string,
     {
-      isSSR: _isSSR,
-      allowStale: _allowStale,
-      encoding: _encoding,
-    }?: {isSSR?: boolean; allowStale?: boolean; encoding?: undefined},
+      isSSR,
+      isHMR,
+      isResolve,
+      allowStale,
+      encoding,
+      importMap,
+    }?: {
+      isSSR?: boolean;
+      isHMR?: boolean;
+      isResolve?: boolean;
+      allowStale?: boolean;
+      importMap?: ImportMap;
+      encoding?: undefined;
+    },
   ): Promise<LoadResult<Buffer | string>>;
   function loadUrl(
     reqUrl: string,
     {
-      isSSR: _isSSR,
-      allowStale: _allowStale,
-      encoding: _encoding,
-    }: {isSSR?: boolean; allowStale?: boolean; encoding: BufferEncoding},
+      isSSR,
+      isHMR,
+      isResolve,
+      allowStale,
+      encoding,
+      importMap,
+    }: {
+      isSSR?: boolean;
+      isHMR?: boolean;
+      isResolve?: boolean;
+      allowStale?: boolean;
+      importMap?: ImportMap;
+      encoding: BufferEncoding;
+    },
   ): Promise<LoadResult<string>>;
   function loadUrl(
     reqUrl: string,
     {
-      isSSR: _isSSR,
-      allowStale: _allowStale,
-      encoding: _encoding,
-    }: {isSSR?: boolean; allowStale?: boolean; encoding: null},
+      isSSR,
+      isHMR,
+      isResolve,
+      allowStale,
+      encoding,
+      importMap,
+    }: {
+      isSSR?: boolean;
+      isHMR?: boolean;
+      isResolve?: boolean;
+      allowStale?: boolean;
+      importMap?: ImportMap;
+      encoding: null;
+    },
   ): Promise<LoadResult<Buffer>>;
   async function loadUrl(
     reqUrl: string,
     {
       isSSR: _isSSR,
       isHMR: _isHMR,
+      isResolve: _isResolve,
       encoding: _encoding,
+      importMap,
     }: {
       isSSR?: boolean;
       isHMR?: boolean;
+      isResolve?: boolean;
       allowStale?: boolean;
       encoding?: BufferEncoding | null;
+      importMap?: ImportMap;
     } = {},
   ): Promise<LoadResult> {
     const isSSR = _isSSR ?? false;
@@ -435,10 +469,10 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
     if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
       const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
-    const loadedModule = await pkgSource.load(webModuleUrl, isSSR, commandOptions);
+      const loadedModule = await pkgSource.load(webModuleUrl, isSSR, commandOptions);
       return {
-      imports: loadedModule.imports,
-      contents: encodeResponse(loadedModule.contents, encoding),
+        imports: loadedModule.imports,
+        contents: encodeResponse(loadedModule.contents, encoding),
         originalFileLoc: null,
         contentType: mime.lookup(reqPath) || 'application/javascript',
       };
@@ -464,7 +498,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         const files = glob.sync(path.join(symlinkResourceDirectory, '*'), {nodir: true});
         for (const f of files) {
           const builtEntrypointUrls = getBuiltFileUrls(f, config);
-          console.log("ADDED", f, builtEntrypointUrls);
+          console.log('ADDED', f, builtEntrypointUrls);
           fileToUrlMapping.add(f, builtEntrypointUrls);
         }
       }
@@ -507,12 +541,13 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       loc: fileLoc,
       type: responseType,
       // contents: responseContents,
-      isStatic: _isStatic,
-      isResolve,
     } = foundFile;
+
+    const isStatic = foundFile.isStatic && responseType !== '.html';
+    const isResolve = foundFile.isResolve && (_isResolve ?? true);
     // Workaround: HMR plugins need to add scripts to HTML file, even if static.
     // TODO: Once plugins are able to add virtual files + imports, this will no longer be needed.
-    const isStatic = _isStatic && responseType !== '.html';
+    // const isStatic = ;
 
     // 1. Check the hot build cache. If it's already found, then just serve it.
     const cacheKey = getCacheKey(fileLoc, {isSSR, env: process.env.NODE_ENV});
@@ -523,12 +558,10 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         isSSR,
         isHMR,
         config,
-        isStatic,
-        isResolve,
         hmrEngine,
       });
       inMemoryBuildCache.set(cacheKey, fileBuilder);
-      await fileBuilder.build();
+      await fileBuilder.build(isStatic);
     }
 
     function handleFinalizeError(err: Error) {
@@ -559,7 +592,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       finalizedResponse = _finalizedResponse;
     } else {
       try {
-        await fileBuilder.resolveImports(reqUrlHmrParam);
+        await fileBuilder.resolveImports(isResolve, reqUrlHmrParam, importMap);
         finalizedResponse = await fileBuilder.getResult(resourceType);
       } catch (err) {
         handleFinalizeError(err);
@@ -852,6 +885,8 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
 
 export async function command(commandOptions: CommandOptions) {
   try {
+    const pkgSource = getPackageSource(commandOptions.config.packageOptions.source);
+    await pkgSource.prepare(commandOptions);
     await startServer(commandOptions);
   } catch (err) {
     logger.error(err.message);

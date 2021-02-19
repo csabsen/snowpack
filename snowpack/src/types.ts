@@ -45,44 +45,31 @@ export interface LoadResult<T = Buffer | string> {
 }
 
 export type OnFileChangeCallback = ({filePath: string}) => any;
-export interface SnowpackDevServer {
+export interface LoadUrlOptions {
+  isSSR?: boolean;
+  isHMR?: boolean;
+  isResolve?: boolean;
+  allowStale?: boolean;
+  encoding?: undefined | BufferEncoding | null;
+  importMap?: ImportMap;
+}
+  export interface SnowpackDevServer {
   port: number;
   hmrEngine: EsmHmrEngine;
   loadUrl: {
     (
       reqUrl: string,
       opt?:
-        | {
-            isSSR?: boolean;
-            isHMR?: boolean;
-            isResolve?: boolean;
-            allowStale?: boolean;
-            encoding?: undefined;
-            importMap?: ImportMap;
-          }
+        | (LoadUrlOptions & {encoding?: undefined})
         | undefined,
     ): Promise<LoadResult<Buffer | string>>;
     (
       reqUrl: string,
-      opt: {
-        isSSR?: boolean;
-        isHMR?: boolean;
-        isResolve?: boolean;
-        allowStale?: boolean;
-        encoding: BufferEncoding;
-        importMap?: ImportMap;
-      },
+      opt: (LoadUrlOptions & {encoding: BufferEncoding})
     ): Promise<LoadResult<string>>;
     (
       reqUrl: string,
-      opt: {
-        isSSR?: boolean;
-        isHMR?: boolean;
-        isResolve?: boolean;
-        allowStale?: boolean;
-        encoding: null;
-        importMap?: ImportMap;
-      },
+      opt: (LoadUrlOptions & {encoding: null})
     ): Promise<LoadResult<Buffer>>;
   };
   handleRequest: (

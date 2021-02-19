@@ -138,7 +138,6 @@ export class FileBuilder {
         }
         if (!resolvedImportUrl) {
           resolvedImportUrl = await pkgSource.resolvePackageImport(this.loc, spec, this.config);
-          console.log('ATTEMPTED TO RESOLVE', spec, resolvedImportUrl);
         }
         return resolvedImportUrl || spec;
       };

@@ -14,12 +14,11 @@ module.exports = {
     // "bundle": true,
   },
   packageOptions: {
-    source: 'remote',
-    
     /* ... */
   },
   devOptions: {
     /* ... */
+    hmr: true,
   },
   buildOptions: {
     /* ... */

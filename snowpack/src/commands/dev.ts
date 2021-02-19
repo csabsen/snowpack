@@ -24,15 +24,15 @@ import {getPackageSource} from '../sources/util';
 import {createLoader as createServerRuntime} from '../ssr-loader';
 import {
   CommandOptions,
-  ImportMap,
   LoadResult,
   OnFileChangeCallback,
   RouteConfigObject,
   ServerRuntime,
   SnowpackDevServer,
+  LoadUrlOptions,
 } from '../types';
 import {hasExtension, HMR_CLIENT_CODE, HMR_OVERLAY_CODE, openInBrowser} from '../util';
-import {getPort, getServerInfoMessage, paintDashboard, paintEvent} from './paint';
+import {getPort, paintDashboard, paintEvent} from './paint';
 
 export class OneToManyMap {
   readonly keyToValue = new Map<string, string[]>();
@@ -281,6 +281,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     messageBus.on(paintEvent.WORKER_MSG, ({id, msg}) => {
       logger.info(msg.trim(), {name: id});
     });
+    // TODO: Don't log, since build() is now using this.
     // messageBus.on(paintEvent.SERVER_START, (info) => {
     //   console.log(getServerInfoMessage(info));
     // });
@@ -364,57 +365,15 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
 
   function loadUrl(
     reqUrl: string,
-    {
-      isSSR,
-      isHMR,
-      isResolve,
-      allowStale,
-      encoding,
-      importMap,
-    }?: {
-      isSSR?: boolean;
-      isHMR?: boolean;
-      isResolve?: boolean;
-      allowStale?: boolean;
-      importMap?: ImportMap;
-      encoding?: undefined;
-    },
+    opt?: (LoadUrlOptions & {encoding?: undefined}) | undefined,
   ): Promise<LoadResult<Buffer | string>>;
   function loadUrl(
     reqUrl: string,
-    {
-      isSSR,
-      isHMR,
-      isResolve,
-      allowStale,
-      encoding,
-      importMap,
-    }: {
-      isSSR?: boolean;
-      isHMR?: boolean;
-      isResolve?: boolean;
-      allowStale?: boolean;
-      importMap?: ImportMap;
-      encoding: BufferEncoding;
-    },
+    opt: LoadUrlOptions & {encoding: BufferEncoding},
   ): Promise<LoadResult<string>>;
   function loadUrl(
     reqUrl: string,
-    {
-      isSSR,
-      isHMR,
-      isResolve,
-      allowStale,
-      encoding,
-      importMap,
-    }: {
-      isSSR?: boolean;
-      isHMR?: boolean;
-      isResolve?: boolean;
-      allowStale?: boolean;
-      importMap?: ImportMap;
-      encoding: null;
-    },
+    opt: LoadUrlOptions & {encoding: null},
   ): Promise<LoadResult<Buffer>>;
   async function loadUrl(
     reqUrl: string,
@@ -424,14 +383,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       isResolve: _isResolve,
       encoding: _encoding,
       importMap,
-    }: {
-      isSSR?: boolean;
-      isHMR?: boolean;
-      isResolve?: boolean;
-      allowStale?: boolean;
-      encoding?: BufferEncoding | null;
-      importMap?: ImportMap;
-    } = {},
+    }: LoadUrlOptions = {},
   ): Promise<LoadResult> {
     const isSSR = _isSSR ?? false;
     //   // Default to HMR on, but disable HMR if SSR mode is enabled.
@@ -553,6 +505,8 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         hmrEngine,
       });
       inMemoryBuildCache.set(cacheKey, fileBuilder);
+    } 
+    if (Object.keys(fileBuilder.buildOutput).length === 0) {
       await fileBuilder.build(isStatic);
     }
 

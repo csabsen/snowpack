@@ -1,11 +1,13 @@
 
-<!-- <Icon data={refresh}/> -->
+<Icon data={refresh}/>
 
 <script>
-  // import Icon from 'svelte-awesome';
-  // import { beer, refresh, comment, codeFork, camera, ban } from 'svelte-awesome/icons';
+  import Icon from 'svelte-awesome';
+  import * as pkg from 'array-flatten';
+  console.log(pkg);
+  import { beer, refresh, comment, codeFork, camera, ban } from 'svelte-awesome/icons';
   import {onMount} from 'svelte';
-  // import TestComponent from 'test-workspace-component/SvelteComponent.svelte';
+  import TestComponent from 'test-workspace-component/SvelteComponent.svelte';
   let count = 0;
   onMount(() => {
     const interval = setInterval(() => count++, 1000);
@@ -63,7 +65,7 @@
 
 <div class="App">
   <header class="App-header">
-    <!-- <TestComponent /> -->
+    <TestComponent />
     <img src="/logo.svg" class="App-logo" alt="logo" />
     <p>Edit <code>src/App.svelte</code> and save to reload.</p>
     <p>Page has been open for <code>{count}</code> seconds.</p>

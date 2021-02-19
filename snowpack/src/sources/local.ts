@@ -62,7 +62,6 @@ export function getLinkedUrl(builtUrl: string) {
 export default {
   async load(id: string, isSSR: boolean): Promise<{contents: Buffer | string, imports: string[]}> {
     const packageImport = allPackageImports[id];
-    console.log(id, allPackageImports);
     const {loc, entrypoint, packageName, packageVersion} = packageImport;
     let {installDest} = packageImport;
     if (isSSR && existsSync(installDest + '-ssr')) {
@@ -180,7 +179,8 @@ export default {
     return;
   },
 
-  async resolvePackageImport(source: string, spec: string, config: SnowpackConfig) {
+  async resolvePackageImport(source: string, spec: string, _config: SnowpackConfig) {
+    config = config || _config;
     const entrypoint = resolveEntrypoint(spec, {
       cwd: path.dirname(source),
       packageLookupFields: ['svelte'],
@@ -191,10 +191,8 @@ export default {
       _packageName += path.sep + specParts.shift();
     }
     const isLinked = !entrypoint.includes(path.join('node_modules', _packageName));
-    console.log(isLinked, _packageName, entrypoint, path.join('node_modules', _packageName));
     if (isLinked) {
       const builtEntrypointUrls = getBuiltFileUrls(entrypoint, config);
-      console.log('builtEntrypointUrls', builtEntrypointUrls);
       allSymlinkImports[builtEntrypointUrls[0]] = entrypoint;
       return path.posix.join(config.buildOptions.metaUrlPath, 'link', builtEntrypointUrls[0]);
     }

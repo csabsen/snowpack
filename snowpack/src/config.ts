@@ -241,7 +241,6 @@ export function expandCliFlags(flags: CLIFlags): SnowpackUserConfig {
     logger.error(`Unknown CLI flag: "${flag}"`);
     process.exit(1);
   }
-  console.log(result);
   if (result.packageOptions.env) {
     result.packageOptions.env = result.packageOptions.env.reduce((acc, id) => {
       const index = id.indexOf('=');
@@ -409,7 +408,6 @@ function normalizeConfig(_config: SnowpackUserConfig): SnowpackConfig {
   );
   config.mount = normalizeMount(config);
   config.routes = normalizeRoutes(config.routes);
-  console.log(config.optimize);
   if (config.optimize && JSON.stringify(config.optimize) !== '{}') {
     config.optimize = {
       entrypoints: config.optimize.entrypoints ?? 'auto',

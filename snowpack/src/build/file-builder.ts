@@ -38,7 +38,6 @@ import {createImportResolver} from './import-resolver';
 export class FileBuilder {
   buildOutput: SnowpackBuildMap = {};
   resolvedOutput: SnowpackBuildMap = {};
-  imports: string[] = [];
 
   isHMR: boolean;
   isSSR: boolean;
@@ -82,11 +81,15 @@ export class FileBuilder {
    * Resolve Imports: Resolved imports are based on the state of the file
    * system, so they can't be cached long-term with the build.
    */
-  async resolveImports(isResolve: boolean, hmrParam?: string | false, importMap?: ImportMap): Promise<void> {
+  async resolveImports(
+    isResolve: boolean,
+    hmrParam?: string | false,
+    importMap?: ImportMap,
+  ): Promise<string[]> {
     const urlPathDirectory = path.posix.dirname(this.urls[0]!);
     const pkgSource = getPackageSource(this.config.packageOptions.source);
-    this.imports = [];
-        for (const [type, outputResult] of Object.entries(this.buildOutput)) {
+    const resolvedImports: string[] = [];
+    for (const [type, outputResult] of Object.entries(this.buildOutput)) {
       if (!(type === '.js' || type === '.html' || type === '.css')) {
         continue;
       }
@@ -115,7 +118,7 @@ export class FileBuilder {
         // Try to resolve the specifier to a known URL in the project
         let resolvedImportUrl = resolveImportSpecifier(spec);
         if (!isResolve) {
-            return resolvedImportUrl || spec;
+          return resolvedImportUrl || spec;
         }
         // Handle a package import
         if (!resolvedImportUrl && importMap) {
@@ -148,15 +151,15 @@ export class FileBuilder {
         const isProxyImport = importExtName && importExtName !== '.js' && importExtName !== '.mjs';
         const isAbsoluteUrlPath = path.posix.isAbsolute(resolvedImportUrl);
         if (isAbsoluteUrlPath) {
-            if (this.config.buildOptions.resolveProxyImports && isProxyImport) {
-                resolvedImportUrl = resolvedImportUrl + '.proxy.js';
-            }
+          if (this.config.buildOptions.resolveProxyImports && isProxyImport) {
+            resolvedImportUrl = resolvedImportUrl + '.proxy.js';
+          }
         }
-        this.imports.push(resolvedImportUrl);
+        resolvedImports.push(resolvedImportUrl);
         if (isAbsoluteUrlPath) {
-            // When dealing with an absolute import path, we need to honor the baseUrl
-            // proxy modules may attach code to the root HTML (like style) so don't resolve
-            resolvedImportUrl = relativeURL(urlPathDirectory, resolvedImportUrl);
+          // When dealing with an absolute import path, we need to honor the baseUrl
+          // proxy modules may attach code to the root HTML (like style) so don't resolve
+          resolvedImportUrl = relativeURL(urlPathDirectory, resolvedImportUrl);
         }
         return resolvedImportUrl;
       });
@@ -166,10 +169,10 @@ export class FileBuilder {
       // `script.src=` and `link.href` scanning & resolving in transformFileImports().
       if (type === '.html' && this.isHMR) {
         if (contents.includes(SRI_CLIENT_HMR_SNOWPACK)) {
-          this.imports.push(getMetaUrlPath('hmr-client.js', this.config));
+          resolvedImports.push(getMetaUrlPath('hmr-client.js', this.config));
         }
         if (contents.includes(SRI_ERROR_HMR_SNOWPACK)) {
-          this.imports.push(getMetaUrlPath('hmr-error-overlay.js', this.config));
+          resolvedImports.push(getMetaUrlPath('hmr-error-overlay.js', this.config));
         }
       }
 
@@ -202,6 +205,7 @@ export class FileBuilder {
       this.resolvedOutput[type].code = contents;
       this.resolvedOutput[type].map = undefined;
     }
+    return resolvedImports;
   }
 
   /**

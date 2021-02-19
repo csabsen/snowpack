@@ -1,5 +1,4 @@
 import isCompressible from 'compressible';
-import {resolveEntrypoint} from 'esinstall';
 import etag from 'etag';
 import {EventEmitter} from 'events';
 import {createReadStream, promises as fs, statSync} from 'fs';
@@ -282,9 +281,9 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     messageBus.on(paintEvent.WORKER_MSG, ({id, msg}) => {
       logger.info(msg.trim(), {name: id});
     });
-    messageBus.on(paintEvent.SERVER_START, (info) => {
-      console.log(getServerInfoMessage(info));
-    });
+    // messageBus.on(paintEvent.SERVER_START, (info) => {
+    //   console.log(getServerInfoMessage(info));
+    // });
   }
 
   const symlinkDirectories = new Set();
@@ -480,11 +479,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
 
     let foundFile: FoundFile;
     if (reqPath.startsWith(PACKAGE_LINK_PATH_PREFIX)) {
-      // const webModuleUrl = reqPath.substr(PACKAGE_LINK_PATH_PREFIX.length);
-      // const entrypoint = resolveEntrypoint(webModuleUrl, {
-      //   cwd: config.root,
-      //   packageLookupFields: ['svelte'],
-      // });
       const symlinkResourcePath = '/' + reqPath.substr(PACKAGE_LINK_PATH_PREFIX.length);
       const symlinkResourceDirectory = path.dirname(symlinkResourcePath);
       if (!symlinkDirectories.has(symlinkResourceDirectory)) {
@@ -498,14 +492,12 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         const files = glob.sync(path.join(symlinkResourceDirectory, '*'), {nodir: true});
         for (const f of files) {
           const builtEntrypointUrls = getBuiltFileUrls(f, config);
-          console.log('ADDED', f, builtEntrypointUrls);
           fileToUrlMapping.add(f, builtEntrypointUrls);
         }
       }
 
       // TODO: scan this directory as if it were a mount entry
       // then, check the map
-      console.log('getLinkedUrl', symlinkResourcePath, fileToUrlMapping.key(symlinkResourcePath));
       foundFile = {
         loc: fileToUrlMapping.key(symlinkResourcePath)!,
         type: path.extname(reqPath),
@@ -576,6 +568,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
 
     let finalizedResponse: string | Buffer;
+    let resolvedImports: string[] = [];
     if (reqPath.endsWith('.proxy.js')) {
       finalizedResponse = await fileBuilder.getProxy(resourcePath, resourceType).catch((err) => {
         handleFinalizeError(err);
@@ -592,7 +585,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       finalizedResponse = _finalizedResponse;
     } else {
       try {
-        await fileBuilder.resolveImports(isResolve, reqUrlHmrParam, importMap);
+        resolvedImports = await fileBuilder.resolveImports(isResolve, reqUrlHmrParam, importMap);
         finalizedResponse = await fileBuilder.getResult(resourceType);
       } catch (err) {
         handleFinalizeError(err);
@@ -601,7 +594,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
 
     return {
-      imports: fileBuilder.imports,
+      imports: resolvedImports,
       contents: encodeResponse(finalizedResponse, encoding),
       originalFileLoc: fileLoc,
       contentType: mime.lookup(responseType),

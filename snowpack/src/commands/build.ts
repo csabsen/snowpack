@@ -75,7 +75,6 @@ async function installOptimizedDependencies(
 export async function build(commandOptions: CommandOptions): Promise<SnowpackBuildResult> {
   const {config} = commandOptions;
   config.buildOptions.resolveProxyImports = !(config.optimize?.bundle);
-  console.log('config.optimize', config.optimize);
   const isSSR = !!config.buildOptions.ssr;
   const isHMR = getIsHmrEnabled(config);
 
@@ -86,7 +85,6 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   mkdirp.sync(buildDirectoryLoc);
 
   const devServer = await startServer(commandOptions);
-  console.log('ONWARD!');
 
   const allFileUrls: string[] = [];
   for (const [mountKey, mountEntry] of Object.entries(config.mount)) {
@@ -119,7 +117,6 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
       }
     }
   }
-  console.log('allBareModuleSpecifiers', allBareModuleSpecifiers);
   const buildEnd = performance.now();
   logger.info(
     `${colors.green('✔')} build complete ${colors.dim(
@@ -147,7 +144,6 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   allFileUrlsToProcess = [...allFileUrlsUnique];
   while (allFileUrlsToProcess.length > 0) {
     const fileUrl = allFileUrlsToProcess.pop()!;
-    console.log('POP', fileUrl);
     if (fileUrl.startsWith(path.posix.join(config.buildOptions.metaUrlPath, 'pkg/'))) {
       continue;
     }
@@ -163,11 +159,9 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
     for (const importedUrl of result.imports) {
       if (!importedUrl.startsWith('/')) {
         allBareModuleSpecifiers.add(importedUrl);
-        console.log('BARE', importedUrl);
       } else if (!allFileUrlsUnique.has(importedUrl)) {
         allFileUrlsUnique.add(importedUrl);
         allFileUrlsToProcess.push(importedUrl);
-        console.log('PUSH', importedUrl);
       }
     }
   }
@@ -181,7 +175,7 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   // "--watch" mode - Start watching the file system.
   if (config.buildOptions.watch) {
     logger.info(
-      `[HMR] WebSocket URL available at ${colors.cyan(
+      `HMR engine available at ${colors.cyan(
         `ws://localhost:${devServer.hmrEngine.port}`,
       )}`,
     );
@@ -193,16 +187,13 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
       allFileUrlsToProcess.push(...getUrlsForFile(filePath, config)!);
       while (allFileUrlsToProcess.length > 0) {
         const fileUrl = allFileUrlsToProcess.pop()!;
-        console.log('POP', fileUrl);
         const result = await devServer.loadUrl(fileUrl, {isSSR});
         await mkdirp(path.dirname(path.join(buildDirectoryLoc, fileUrl)));
         await fs.writeFile(path.join(buildDirectoryLoc, fileUrl), result.contents);
-        console.log('IMPORTS', result.imports);
         for (const importedUrl of result.imports) {
           if (!allFileUrlsUnique.has(importedUrl)) {
             allFileUrlsUnique.add(importedUrl);
             allFileUrlsToProcess.push(importedUrl);
-            console.log('PUSH', importedUrl);
           }
         }
       }

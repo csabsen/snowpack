@@ -5,6 +5,7 @@ import * as colors from 'kleur/colors';
 import mkdirp from 'mkdirp';
 import path from 'path';
 import {performance} from 'perf_hooks';
+import {wrapImportProxy} from '../build/build-import-proxy';
 import {runPipelineCleanupStep, runPipelineOptimizeStep} from '../build/build-pipeline';
 import {getUrlsForFile} from '../build/file-urls';
 import {runBuiltInOptimize} from '../build/optimize';
@@ -18,7 +19,7 @@ import {
   SnowpackBuildResult,
   SnowpackConfig,
 } from '../types';
-import {deleteFromBuildSafe} from '../util';
+import {deleteFromBuildSafe, isRemoteUrl} from '../util';
 import {startServer} from './dev';
 
 function getIsHmrEnabled(config: SnowpackConfig) {
@@ -81,9 +82,12 @@ async function installOptimizedDependencies(
 
 export async function build(commandOptions: CommandOptions): Promise<SnowpackBuildResult> {
   const {config} = commandOptions;
-  config.buildOptions.resolveProxyImports = !config.optimize?.bundle;
+  const isDev = !!config.buildOptions.watch;
   const isSSR = !!config.buildOptions.ssr;
   const isHMR = getIsHmrEnabled(config);
+  config.buildOptions.resolveProxyImports = !config.optimize?.bundle;
+  config.devOptions.hmrPort = isHMR ? config.devOptions.hmrPort : undefined;
+  config.devOptions.port = 0;
 
   const buildDirectoryLoc = config.buildOptions.out;
   if (config.buildOptions.clean) {
@@ -91,7 +95,7 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
   }
   mkdirp.sync(buildDirectoryLoc);
 
-  const devServer = await startServer(commandOptions);
+  const devServer = await startServer(commandOptions, {isDev});
 
   const allFileUrls: string[] = [];
   for (const [mountKey, mountEntry] of Object.entries(config.mount)) {
@@ -102,7 +106,10 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
     });
     for (const f of files) {
       const fileUrls = getUrlsForFile(f, config)!;
-      allFileUrls.push(...fileUrls);
+      // Only push the first URL. In multi-file builds, this is always the JS that the
+      // CSS is imported from (if it exists). That CSS may not exist, and we don't know
+      // until the JS has been built/loaded.
+      allFileUrls.push(fileUrls[0]);
     }
   }
 
@@ -115,16 +122,36 @@ export async function build(commandOptions: CommandOptions): Promise<SnowpackBui
     ignorePkg: boolean,
     loadOptions: LoadUrlOptions & {encoding?: undefined},
   ) {
+    console.log('SCAN', allFileUrlsToProcess);
     while (allFileUrlsToProcess.length > 0) {
-      const fileUrl = allFileUrlsToProcess.pop()!;
+      const fileUrl = allFileUrlsToProcess.shift()!;
+      console.log('GO', fileUrl);
+      // TODO: what about import proxies! We wanted to be able to import them using this method
+      // but this line ignores them. Instead, do we want to turn the server into some sort of
+      // "load packages as local files" mode? Or, tell it what to do with import proxies?
+      // does dev even work this way?
+      // Also: "test/build/import-json" fails to start
       if (ignorePkg && fileUrl.startsWith(pkgUrlPrefix)) {
+        if (fileUrl.endsWith('.proxy.js')) {
+          const pkgContents = await fs.readFile(path.join(buildDirectoryLoc, fileUrl.replace('.proxy.js', '')));
+          const pkgContentsProxy = await wrapImportProxy({
+            url: fileUrl.replace('.proxy.js', ''),
+            code: pkgContents,
+            hmr: isHMR,
+            config: config,
+          });
+          await fs.writeFile(path.join(buildDirectoryLoc, fileUrl), pkgContentsProxy);
+        }
         continue;
       }
       const result = await devServer.loadUrl(fileUrl, loadOptions);
       await mkdirp(path.dirname(path.join(buildDirectoryLoc, fileUrl)));
       await fs.writeFile(path.join(buildDirectoryLoc, fileUrl), result.contents);
+      console.log('SCAN', result.imports);
       for (const importedUrl of result.imports) {
-        if (!importedUrl.startsWith('/')) {
+        if (isRemoteUrl(importedUrl)) {
+          // do nothing
+        } else if (!importedUrl.startsWith('/')) {
           allBareModuleSpecifiers.add(importedUrl);
         } else if (!allFileUrlsUnique.has(importedUrl)) {
           allFileUrlsUnique.add(importedUrl);

@@ -73,6 +73,11 @@ export default {
     await inProgressBuilds.onIdle();
     let packageCode = await fs.readFile(loc, 'utf8');
     const imports: string[] = [];
+    const type = path.extname(loc);
+    if (!(type === '.js' || type === '.html' || type === '.css')) {
+    return {contents: packageCode, imports};
+    }
+
     const packageImportMap = JSON.parse(
       await fs.readFile(path.join(installDest, 'import-map.json'), 'utf8'),
     );
@@ -114,7 +119,7 @@ export default {
     };
 
     packageCode = await transformFileImports(
-      {type: path.extname(loc), contents: packageCode},
+      {type, contents: packageCode},
       async spec => {
         const resolvedSpec = await resolveImport(spec);
         imports.push(path.resolve(path.posix.join(config.buildOptions.metaUrlPath, 'pkg', id), resolvedSpec));
@@ -232,6 +237,7 @@ export default {
           ...Object.keys(packageManifest.devDependencies || {}),
           ...Object.keys(packageManifest.peerDependencies || {}),
         ];
+
         const installOptions = {
           dest: installDest,
           cwd: packageManifestLoc,
@@ -247,7 +253,7 @@ export default {
           installTargets,
           installOptions,
         });
-        console.log(`Installing ${spec}... DONE`, Object.keys(newImportMap.imports));
+        console.log(`Installing ${spec}... DONE`, spec, packageManifest.name, allKnownSpecs, installTargets, Object.keys(newImportMap.imports));
         if (needsSsrBuild) {
           console.log(`Installing ${spec} (ssr)...`);
           await installPackages({

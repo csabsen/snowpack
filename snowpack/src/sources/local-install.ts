@@ -5,7 +5,7 @@ import util from 'util';
 import url from 'url';
 import {buildFile} from '../build/build-pipeline';
 import {logger} from '../logger';
-import {ImportMap, SnowpackConfig} from '../types';
+import {ImportMap, SnowpackBuiltFile, SnowpackConfig} from '../types';
 
 interface InstallOptions {
   config: SnowpackConfig;
@@ -52,6 +52,11 @@ export async function installPackages({
           async load(id: string) {
             // console.log('load()', id);
             needsSsrBuild = needsSsrBuild || id.endsWith('.svelte');
+            // TODO: Since this is new, only introduce for non-JS files.
+            // Consider running on all files in future versions.
+            if (id.endsWith('.js')) {
+              return;
+            }
             const output = await buildFile(url.pathToFileURL(id), {
               config,
               isDev,

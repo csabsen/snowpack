@@ -22,6 +22,7 @@ const UTF8_FRIENDLY_EXTS = [
 
 /** setup for /tests/build/* */
 function setupBuildTest(cwd) {
+  console.log(cwd);
   return execSync('yarn testbuild', {cwd});
 }
 exports.setupBuildTest = setupBuildTest;
@@ -47,7 +48,7 @@ function readFiles(directory, {ignore} = {}) {
     nodir: true,
     ignore,
   });
-
+  
   allFiles.forEach((filepath) => {
     const relativePath = filepath.replace(/^\/?/, '/');
     contents[relativePath] = fs.readFileSync(path.join(directory, filepath), 'utf8');

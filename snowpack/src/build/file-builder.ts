@@ -39,6 +39,7 @@ export class FileBuilder {
   buildOutput: SnowpackBuildMap = {};
   resolvedOutput: SnowpackBuildMap = {};
 
+  isDev: boolean;
   isHMR: boolean;
   isSSR: boolean;
   buildPromise: Promise<SnowpackBuildMap> | undefined;
@@ -50,18 +51,21 @@ export class FileBuilder {
 
   constructor({
     loc,
+    isDev,
     isHMR,
     isSSR,
     config,
     hmrEngine,
   }: {
     loc: string;
+    isDev: boolean;
     isHMR: boolean;
     isSSR: boolean;
     config: SnowpackConfig;
     hmrEngine?: EsmHmrEngine | null;
   }) {
     this.loc = loc;
+    this.isDev = isDev;
     this.isHMR = isHMR;
     this.isSSR = isSSR;
     this.config = config;
@@ -72,7 +76,7 @@ export class FileBuilder {
   private verifyRequestFromBuild(type: string): SnowpackBuiltFile {
     // Verify that the requested file exists in the build output map.
     if (!this.resolvedOutput[type] || !Object.keys(this.resolvedOutput)) {
-      throw new Error(`Requested content "${type}" but built ${Object.keys(this.resolvedOutput)}`);
+      throw new Error(`${this.loc} - Requested content "${type}" but built ${Object.keys(this.resolvedOutput)}`);
     }
     return this.resolvedOutput[type];
   }
@@ -82,7 +86,7 @@ export class FileBuilder {
    * system, so they can't be cached long-term with the build.
    */
   async resolveImports(
-    isResolve: boolean,
+    isResolveBareImports: boolean,
     hmrParam?: string | false,
     importMap?: ImportMap,
   ): Promise<string[]> {
@@ -117,7 +121,7 @@ export class FileBuilder {
       const resolveImport = async (spec) => {
         // Try to resolve the specifier to a known URL in the project
         let resolvedImportUrl = resolveImportSpecifier(spec);
-        if (!isResolve) {
+        if (!isResolveBareImports) {
           return resolvedImportUrl || spec;
         }
         // Handle a package import
@@ -134,6 +138,9 @@ export class FileBuilder {
         }
         // Ignore packages marked as external
         if (this.config.packageOptions.external?.includes(spec)) {
+          return spec;
+        }
+        if (isRemoteUrl(spec)) {
           return spec;
         }
         if (!resolvedImportUrl) {
@@ -228,7 +235,7 @@ export class FileBuilder {
       }
       const builtFileOutput = await buildFile(url.pathToFileURL(this.loc), {
         config: this.config,
-        isDev: true,
+        isDev: this.isDev,
         isSSR: this.isSSR,
         isPackage: false,
         isHmrEnabled: this.isHMR,
@@ -255,9 +262,9 @@ export class FileBuilder {
           code: content as string,
           hmr: this.isHMR,
           hmrPort: this.hmrEngine ? this.hmrEngine.port : undefined,
-          isDev: true,
+          isDev: this.isDev,
           config: this.config,
-          mode: 'development',
+          mode: this.isDev ? 'development' : 'production',
         });
         break;
       }

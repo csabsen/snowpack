@@ -19,6 +19,7 @@ To Resolve:
         packageOptions: {external: ['/__web-dev-server__web-socket.js']},
         devOptions: {open: 'none', output: 'stream', hmr: false},
       });
+      await snowpack.preparePackages({config, lockfile: null});
       fileWatcher.add(Object.keys(config.mount));
       server = await snowpack.startServer({
         config,

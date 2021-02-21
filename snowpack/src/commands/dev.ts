@@ -1,4 +1,5 @@
 import isCompressible from 'compressible';
+import detectPort from 'detect-port';
 import etag from 'etag';
 import {EventEmitter} from 'events';
 import {createReadStream, promises as fs, statSync} from 'fs';
@@ -15,7 +16,7 @@ import stream from 'stream';
 import url from 'url';
 import util from 'util';
 import zlib from 'zlib';
-import {generateEnvModule, getMetaUrlPath} from '../build/build-import-proxy';
+import {generateEnvModule, getMetaUrlPath, wrapImportProxy} from '../build/build-import-proxy';
 import {FileBuilder} from '../build/file-builder';
 import {getBuiltFileUrls, getMountEntryForFile, getUrlsForFile} from '../build/file-urls';
 import {EsmHmrEngine} from '../hmr-server-engine';
@@ -32,7 +33,7 @@ import {
   LoadUrlOptions,
 } from '../types';
 import {hasExtension, HMR_CLIENT_CODE, HMR_OVERLAY_CODE, openInBrowser} from '../util';
-import {getPort, paintDashboard, paintEvent} from './paint';
+import {getPort, getServerInfoMessage, paintDashboard, paintEvent} from './paint';
 
 export class OneToManyMap {
   readonly keyToValue = new Map<string, string[]>();
@@ -106,7 +107,7 @@ class NotFoundError extends Error {
   lookups: string[];
 
   constructor(lookups: string[]) {
-    super('NOT_FOUND');
+    super(`NOT_FOUND:  ✘ ${lookups.join(', ')}`);
     this.lookups = lookups;
   }
 }
@@ -237,21 +238,26 @@ function getServerRuntime(
   return runtime;
 }
 
-export async function startServer(commandOptions: CommandOptions): Promise<SnowpackDevServer> {
+export async function startServer(
+  commandOptions: CommandOptions,
+  {isDev}: {isDev: boolean} = {isDev: true},
+): Promise<SnowpackDevServer> {
   const {config} = commandOptions;
   // Start the startup timer!
   let serverStart = performance.now();
 
   const {port: defaultPort, hostname, open} = config.devOptions;
   const messageBus = new EventEmitter();
-  const port = await getPort(defaultPort);
   const pkgSource = getPackageSource(config.packageOptions.source);
   const PACKAGE_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'pkg/');
   const PACKAGE_LINK_PATH_PREFIX = path.posix.join(config.buildOptions.metaUrlPath, 'link/');
-
-  // Reset the clock if we had to wait for the user prompt to select a new port.
-  if (port !== defaultPort) {
-    serverStart = performance.now();
+  let port: number | undefined;
+  if (defaultPort !== 0) {
+    port = await getPort(defaultPort);
+    // Reset the clock if we had to wait for the user prompt to select a new port.
+    if (port !== defaultPort) {
+      serverStart = performance.now();
+    }
   }
 
   // Fill in any command-specific plugin methods.
@@ -281,10 +287,9 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     messageBus.on(paintEvent.WORKER_MSG, ({id, msg}) => {
       logger.info(msg.trim(), {name: id});
     });
-    // TODO: Don't log, since build() is now using this.
-    // messageBus.on(paintEvent.SERVER_START, (info) => {
-    //   console.log(getServerInfoMessage(info));
-    // });
+    messageBus.on(paintEvent.SERVER_START, (info) => {
+      logger.info(`Server started in ${info.startTimeMs}ms.`);
+    });
   }
 
   const symlinkDirectories = new Set();
@@ -340,10 +345,10 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
 
   for (const runPlugin of config.plugins) {
     if (runPlugin.run) {
-      logger.debug(`starting ${runPlugin.name} run() in watch/isDev mode`);
+      logger.debug(`starting ${runPlugin.name} run() workers`);
       runPlugin
         .run({
-          isDev: true,
+          isDev,
           // @ts-ignore: internal API only
           log: (msg, data) => {
             if (msg === 'CONSOLE_INFO') {
@@ -419,8 +424,17 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       };
     }
     if (reqPath.startsWith(PACKAGE_PATH_PREFIX)) {
-      const webModuleUrl = reqPath.substr(PACKAGE_PATH_PREFIX.length);
-      const loadedModule = await pkgSource.load(webModuleUrl, isSSR, commandOptions);
+      console.log('resourcePath', resourcePath);
+      const webModuleUrl = resourcePath.substr(PACKAGE_PATH_PREFIX.length);
+      let loadedModule = await pkgSource.load(webModuleUrl, isSSR, commandOptions);
+      if (reqPath.endsWith('.proxy.js')) {
+      return {
+        imports: [],
+        contents: await wrapImportProxy({url: resourcePath, code: loadedModule.contents, hmr: isHMR, config: config}),
+        originalFileLoc: null,
+        contentType: 'application/javascript',
+      };
+    }
       return {
         imports: loadedModule.imports,
         contents: encodeResponse(loadedModule.contents, encoding),
@@ -448,8 +462,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
         }
       }
 
-      // TODO: scan this directory as if it were a mount entry
-      // then, check the map
+      // TODO: scan this directory as if it were a mount entry. then, check the map
       foundFile = {
         loc: fileToUrlMapping.key(symlinkResourcePath)!,
         type: path.extname(reqPath),
@@ -488,7 +501,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     } = foundFile;
 
     const isStatic = foundFile.isStatic && responseType !== '.html';
-    const isResolve = foundFile.isResolve && (_isResolve ?? true);
+    const isResolve = _isResolve ?? true;
     // Workaround: HMR plugins need to add scripts to HTML file, even if static.
     // TODO: Once plugins are able to add virtual files + imports, this will no longer be needed.
     // const isStatic = ;
@@ -499,13 +512,14 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     if (!fileBuilder) {
       fileBuilder = new FileBuilder({
         loc: fileLoc,
+        isDev,
         isSSR,
         isHMR,
         config,
         hmrEngine,
       });
       inMemoryBuildCache.set(cacheKey, fileBuilder);
-    } 
+    }
     if (Object.keys(fileBuilder.buildOutput).length === 0) {
       await fileBuilder.build(isStatic);
     }
@@ -539,7 +553,9 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
       finalizedResponse = _finalizedResponse;
     } else {
       try {
-        resolvedImports = await fileBuilder.resolveImports(isResolve, reqUrlHmrParam, importMap);
+        if (foundFile.isResolve) {
+          resolvedImports = await fileBuilder.resolveImports(isResolve, reqUrlHmrParam, importMap);
+        }
         finalizedResponse = await fileBuilder.getResult(resourceType);
       } catch (err) {
         handleFinalizeError(err);
@@ -645,27 +661,55 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     return http.createServer(responseHandler as http.RequestListener);
   };
 
-  const server = createServer(async (req, res) => {
-    // Attach a request logger.
-    res.on('finish', () => {
-      const {method, url} = req;
-      const {statusCode} = res;
-      logger.debug(`[${statusCode}] ${method} ${url}`);
-    });
-    // Otherwise, pass requests directly to Snowpack's request handler.
-    handleRequest(req, res);
-  })
-    .on('error', (err: Error) => {
-      logger.error(colors.red(`  ✘ Failed to start server at port ${colors.bold(port)}.`), err);
-      server.close();
-      process.exit(1);
+  let server: ReturnType<typeof createServer> | undefined;
+  if (port) {
+    server = createServer(async (req, res) => {
+      // Attach a request logger.
+      res.on('finish', () => {
+        const {method, url} = req;
+        const {statusCode} = res;
+        logger.debug(`[${statusCode}] ${method} ${url}`);
+      });
+      // Otherwise, pass requests directly to Snowpack's request handler.
+      handleRequest(req, res);
     })
-    .listen(port);
+      .on('error', (err: Error) => {
+        logger.error(colors.red(`  ✘ Failed to start server at port ${colors.bold(port!)}.`), err);
+        server!.close();
+        process.exit(1);
+      })
+      .listen(port);
+
+    // Announce server has started
+    const remoteIps = Object.values(os.networkInterfaces())
+      .reduce((every: os.NetworkInterfaceInfo[], i) => [...every, ...(i || [])], [])
+      .filter((i) => i.family === 'IPv4' && i.internal === false)
+      .map((i) => i.address);
+    const protocol = config.devOptions.secure ? 'https:' : 'http:';
+    messageBus.emit(paintEvent.SERVER_START, {
+      protocol,
+      hostname,
+      port,
+      remoteIp: remoteIps[0],
+      startTimeMs: Math.round(performance.now() - serverStart),
+    });
+
+    // Open the user's browser (ignore if failed)
+    if (open && open !== 'none') {
+      await openInBrowser(protocol, hostname, port, open).catch((err) => {
+        logger.debug(`Browser open error: ${err}`);
+      });
+    }
+  }
 
   const {hmrDelay} = config.devOptions;
+  const hmrPort =
+    config.devOptions.hmrPort ||
+    config.devOptions.port ||
+    (await detectPort(config.devOptions.hmrPort || config.devOptions.port));
   const hmrEngineOptions = Object.assign(
     {delay: hmrDelay},
-    config.devOptions.hmrPort ? {port: config.devOptions.hmrPort} : {server, port},
+    config.devOptions.hmrPort || !server ? {port: hmrPort} : {server, port: hmrPort},
   );
   const hmrEngine = new EsmHmrEngine(hmrEngineOptions);
   onProcessExit(() => {
@@ -743,27 +787,6 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     }
   }
 
-  // Announce server has started
-  const remoteIps = Object.values(os.networkInterfaces())
-    .reduce((every: os.NetworkInterfaceInfo[], i) => [...every, ...(i || [])], [])
-    .filter((i) => i.family === 'IPv4' && i.internal === false)
-    .map((i) => i.address);
-  const protocol = config.devOptions.secure ? 'https:' : 'http:';
-  messageBus.emit(paintEvent.SERVER_START, {
-    protocol,
-    hostname,
-    port,
-    remoteIp: remoteIps[0],
-    startTimeMs: Math.round(performance.now() - serverStart),
-  });
-
-  // Open the user's browser (ignore if failed)
-  if (open && open !== 'none') {
-    await openInBrowser(protocol, hostname, port, open).catch((err) => {
-      logger.debug(`Browser open error: ${err}`);
-    });
-  }
-
   // Start watching the file system.
   // Defer "chokidar" loading to here, to reduce impact on overall startup time
   const chokidar = await import('chokidar');
@@ -824,7 +847,7 @@ export async function startServer(commandOptions: CommandOptions): Promise<Snowp
     getServerRuntime: (options) => getServerRuntime(sp, options),
     async shutdown() {
       await watcher.close();
-      server.close();
+      server && server.close();
     },
   } as SnowpackDevServer;
   return sp;

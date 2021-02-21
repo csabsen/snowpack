@@ -18,7 +18,7 @@ exports[`exclude-external-packages matches the snapshot: web_modules/import-map.
 `;
 
 exports[`exclude-external-packages matches the snapshot: web_modules/react-dom.js 1`] = `
-"import require$$0 from 'react';
+"import * as react from 'react';
 function createCommonjsModule(fn, basedir, module) {
 	return module = {
 		path: basedir,
@@ -27,6 +27,9 @@ function createCommonjsModule(fn, basedir, module) {
 			return commonjsRequire(path, (base === undefined || base === null) ? module.path : base);
 		}
 	}, fn(module, module.exports), module.exports;
+}
+function getDefaultExportFromNamespaceIfNotNamed (n) {
+	return n && Object.prototype.hasOwnProperty.call(n, 'default') && Object.keys(n).length === 1 ? n['default'] : n;
 }
 function commonjsRequire () {
 	throw new Error('Dynamic requires are not currently supported by @rollup/plugin-commonjs');
@@ -1096,6 +1099,7 @@ var tracing = createCommonjsModule(function (module) {
   module.exports = schedulerTracing_development;
 }
 });
+var require$$0 = /*@__PURE__*/getDefaultExportFromNamespaceIfNotNamed(react);
 var reactDom_development = createCommonjsModule(function (module, exports) {
 {
   (function() {
